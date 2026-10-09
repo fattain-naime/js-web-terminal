@@ -101,8 +101,7 @@ library only). Nothing to install on either end.
    const TERMINAL_PASSWORD_HASH = '$2y$10$...your hash...';
    ```
 
-   Login stays disabled until a hash is set. The old default password
-   (`123`) is rejected. A legacy 32-character MD5 hash still works but
+   Login stays disabled until a hash is set.  A legacy 32-character MD5 hash still works but
    bcrypt is strongly recommended.
 
 3. **(Optional, recommended for the CLI) Set an API key**, so scripts and
@@ -316,5 +315,4 @@ free to open an issue or submit a PR.
 
 ## License
 
-This project is licensed under the GPL v2.0 License. See the `LICENSE`
-file for details.
+This project is licensed under the GPL v2.0 License. See the [LICENSE](https://github.com/fattain-naime/js-web-terminal/blob/main/LICENSE) file for details.
