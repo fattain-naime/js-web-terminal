@@ -11,10 +11,13 @@ your web root, paste in a password hash, and you're running `ls`, `git`,
 `composer` and `docker` on the server. Nothing to install, nothing to build,
 no dependencies.
 
-<table>
-<tr><td width="50%" valign="top">
+## 🎯 Two ways in
 
-### 🖥️ In the browser
+One backend, two front doors — both modes talk to the same API, and share the
+same working directory and command history for a given login. Use whichever
+suits the moment.
+
+### 🖥️ Browser UI
 
 A dark, native-feeling terminal that fills the screen and never scrolls the
 page itself:
@@ -28,9 +31,7 @@ page itself:
 - **System info panel**, plus dark/light theme and adjustable font size.
 - **Full keyboard control** — `↑`/`↓` history, `Ctrl+L` clear, `Ctrl+C` kill.
 
-</td><td width="50%" valign="top">
-
-### ⌨️ From your own terminal
+### ⌨️ CLI client
 
 The same backend, driven by `webterm_client.py` — one dependency-free Python 3
 file, standard library only:
@@ -42,15 +43,14 @@ file, standard library only:
   command's exit code.
 - **API key** login so no password prompt in unattended jobs.
 
-</td></tr>
-</table>
+And that is the whole thing — two files, no dependencies:
 
 ```
 web_terminal.php   the backend + browser UI, in one file
 webterm_client.py  the CLI client, in one file
 ```
 
-## Features
+## ✨ Features
 
 - **Dual mode** - use the browser, or run `webterm_client.py` from your own
   terminal against the same deployment. Both talk to the same JSON API, and
@@ -110,17 +110,18 @@ webterm_client.py  the CLI client, in one file
 - **Self-contained** - the whole web app is one PHP file; the CLI client
   is one Python file using only the standard library.
 
-## Contents
+## 🗺️ Contents
 
+- [Two ways in](#two-ways-in) — the browser UI and the CLI client
 - [Features](#features)
 - [Quick start](#quick-start)
 - [Getting started](#getting-started) — prerequisites, full installation, Windows hosts
-- [Usage](#usage) — in the browser, from the CLI, troubleshooting, examples
+- [Usage](#usage) — in the browser, keyboard, from the CLI, troubleshooting, examples
 - [Configuration](#configuration) — every constant, plus known limitations
 - [Security considerations](#security-considerations)
 - [Contributing](#contributing) · [License](#license)
 
-## Quick start
+## 🚀 Quick start
 
 If you just want it running:
 
@@ -136,9 +137,9 @@ Open `http://127.0.0.1:8000/web_terminal.php`, log in, and type `help` or
 `cmds`. The full walkthrough — API keys, protecting the data directory, nginx
 and Apache notes — is in [Installation](#installation) below.
 
-## Getting Started
+## 🛠️ Getting Started
 
-### Prerequisites
+### 📦 Prerequisites
 
 - A web server capable of running PHP (PHP 7.0+; a Linux/Unix host is
   needed for background jobs - see **Windows hosts** below). PHP's
@@ -146,7 +147,7 @@ and Apache notes — is in [Installation](#installation) below.
 - Python 3 on your own machine if you want to use the CLI client - no
   extra packages needed.
 
-### Installation
+### 📥 Installation
 
 1. Clone or download this repository to your web server's document root:
 
@@ -216,7 +217,7 @@ and Apache notes — is in [Installation](#installation) below.
    the top of the file) to a path **outside** the document root entirely,
    if your hosting lets you write there.
 
-### Windows hosts
+### 🪟 Windows hosts
 
 The background-job engine (and therefore `cd` persistence and job
 list/kill) relies on POSIX shell features (`setsid`, `nohup`, process
@@ -227,9 +228,9 @@ version of this script worked - no `cd` persistence, no background jobs.
 Everything else (login, API key, upload/download, audit log) still works.
 For the full feature set, use a Linux/Unix host.
 
-## Usage
+## 🎮 Usage
 
-### In the browser
+### 🖥️ In the browser
 
 1. Open the script URL. You'll see a login overlay.
 2. Enter your password and click **Login**.
@@ -253,7 +254,7 @@ For the full feature set, use a Linux/Unix host.
    commands (`clear`, `exit`, `theme`, `upload`, `download <path>`,
    `jobs`, `cmds`).
 
-### Keyboard
+### ⌨️ Keyboard
 
 **Autocomplete**
 
@@ -268,7 +269,7 @@ For the full feature set, use a Linux/Unix host.
 - <kbd>Ctrl</kbd>+<kbd>L</kbd> — clear the screen
 - <kbd>Ctrl</kbd>+<kbd>C</kbd> — kill the running job
 
-### From your own terminal (CLI)
+### 💻 From your own terminal (CLI)
 
 ```bash
 # Interactive shell, prompts for your password:
@@ -320,7 +321,7 @@ Environment variables: `WEBTERM_API_KEY` (same as `--api-key`),
 `WEBTERM_USER_AGENT` (override the `User-Agent` header, in case your host's
 WAF blocks the default one).
 
-### Troubleshooting
+### 🩺 Troubleshooting
 
 | Symptom | What it means |
 | --- | --- |
@@ -331,7 +332,7 @@ WAF blocks the default one).
 | `No credentials received` | The server never saw your key, so the client retries once with the key in the JSON body — useful on hosts that strip custom headers. If it still fails, your host is blocking the request outright. Note the fallback only triggers against a `web_terminal.php` new enough to send that signal. |
 | `Could not reach ...` / connection refused | Wrong URL, or the script isn't deployed there. Note that `web_terminal.php` must be reachable at the exact URL you pass. |
 
-### Example
+### 🧪 Example
 
 After logging in (either mode), try:
 
@@ -342,7 +343,7 @@ php -v               # show the PHP version running on the server
 composer install     # a slow command - becomes a background job automatically
 ```
 
-## Configuration
+## ⚙️ Configuration
 
 All options are constants near the top of `web_terminal.php`:
 
@@ -371,7 +372,7 @@ second, shared identity (so all CLI invocations using the same key share
 one `cd` history - handy for scripting, since `cd /some/project` in one
 CLI call is still in effect on the next).
 
-### Known limitations
+### 🚧 Known limitations
 
 - Environment variables set with `export` do **not** persist between
   separate commands (only the working directory does) - each command
@@ -389,7 +390,7 @@ CLI call is still in effect on the next).
 - No background jobs, `cd` persistence, or kill on Windows hosts (see
   **Windows hosts** above).
 
-## Security Considerations
+## 🔒 Security Considerations
 
 This project intentionally removes command restrictions to provide
 maximum flexibility. As a result, **it will execute any command** the
@@ -414,12 +415,12 @@ authenticated user or API key supplies. Keep in mind:
 If you need a more constrained environment, consider reintroducing an
 allow-list of safe commands.
 
-## Contributing
+## 🤝 Contributing
 
 Pull requests are welcome! If you have ideas for improvements - additional
 authentication mechanisms, more client commands, UI enhancements - feel
 free to open an issue or submit a PR.
 
-## License
+## 📜 License
 
 This project is licensed under the GPL v2.0 License. See the [LICENSE](https://github.com/fattain-naime/js-web-terminal/blob/main/LICENSE) file for details.
