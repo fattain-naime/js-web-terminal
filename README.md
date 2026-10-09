@@ -108,7 +108,7 @@ library only). Nothing to install on either end.
    the CLI client don't need an interactive password prompt:
 
    ```bash
-   php -r "$k = bin2hex(random_bytes(24)); echo $k, PHP_EOL, password_hash($k, PASSWORD_DEFAULT), PHP_EOL;"
+   php -r '$k = bin2hex(random_bytes(24)); echo $k, PHP_EOL, password_hash($k, PASSWORD_DEFAULT), PHP_EOL;'
    ```
 
    This prints two lines: the **raw key** (keep it for yourself - pass it
