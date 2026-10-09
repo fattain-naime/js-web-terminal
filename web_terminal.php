@@ -185,6 +185,11 @@ function wt_error_handler($severity, $message, $file = null, $line = null)
 /** Uncaught exceptions (PHP 7+ turns most fatals into these) bypass the error handler. */
 function wt_exception_handler($e)
 {
+    // Installing this handler suppresses PHP's own "Fatal error: Uncaught ..."
+    // report, so log it here first - otherwise the error log the client is told
+    // to check would be empty.
+    error_log('Uncaught ' . get_class($e) . ': ' . $e->getMessage()
+        . ' in ' . $e->getFile() . ' on line ' . $e->getLine());
     wt_php_error_response();
 }
 

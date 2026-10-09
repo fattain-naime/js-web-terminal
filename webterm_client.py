@@ -41,7 +41,6 @@ import getpass
 import json
 import os
 import re
-import shlex
 import signal
 import ssl
 import sys
@@ -331,10 +330,7 @@ def profile_path(name):
 
 
 def load_profile(name):
-    try:
-        path = profile_path(name)
-    except WebTermError:
-        raise
+    path = profile_path(name)
     try:
         with open(path) as f:
             data = json.load(f)
@@ -451,11 +447,12 @@ def run_one_shot(client, command):
 
 
 def split_args(text):
-    """Split a built-in's arguments, honouring quotes so paths may contain spaces."""
-    try:
-        return shlex.split(text)
-    except ValueError:
-        return text.split()
+    """Split a built-in's arguments, honouring quotes so paths may contain spaces.
+
+    Deliberately not shlex: its POSIX mode reads a backslash as an escape and so
+    strips the separators out of a Windows path.
+    """
+    return [quoted or bare for quoted, bare in re.findall(r'"([^"]*)"|(\S+)', text)]
 
 
 def repl(client):
