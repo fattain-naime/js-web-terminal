@@ -1338,13 +1338,6 @@ $wtBoot = [
         }
         .terminal-header .title { font-weight: bold; color: var(--text); white-space: nowrap; }
         .right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-        /* Whole row is one tap target on phones, still compact on desktop. */
-        @media (max-width: 640px) {
-            body { padding: 0; }
-            .terminal-container { border-radius: 0; box-shadow: none; }
-            .icon-btn { padding: 6px 10px; font-size: 13px; }
-            .terminal-footer { font-size: 11px; padding: 5px 10px; }
-        }
         .icon-btn {
             background: transparent;
             color: var(--muted);
@@ -1481,6 +1474,15 @@ $wtBoot = [
         }
         .terminal-footer a { color: #8fb1ff; text-decoration: none; font-weight: 600; }
         .terminal-footer a:hover { text-decoration: underline; }
+        /* Phone layout. Kept last so the overrides below win the cascade:
+           a media query adds no specificity, only source order decides. */
+        @media (max-width: 640px) {
+            body { padding: 0; }
+            .terminal-container { border-radius: 0; box-shadow: none; }
+            /* Whole row is one tap target on phones, still compact on desktop. */
+            .icon-btn { padding: 6px 10px; font-size: 13px; }
+            .terminal-footer { font-size: 11px; padding: 5px 10px; }
+        }
     </style>
 </head>
 <body>
@@ -1743,6 +1745,7 @@ $wtBoot = [
         currentJob = null;
         cmdInput.disabled = true;
         cmdInput.value = '';
+        closeSuggest();
         logoutBtn.style.display = 'none';
         statusText.textContent = 'Not Authenticated';
         loginOverlay.style.display = 'flex';
@@ -1960,8 +1963,15 @@ $wtBoot = [
         if (!c) return false;
         const b = currentWordBounds();
         // Entries are whole commands like `git log --oneline`, so only splice
-        // a multi-word one in where a whole command belongs: at the start of
-        // the line. Anywhere else it would replace a plain argument.
+        // one in where a whole command belongs: at the start of the line.
+        // Anywhere else it would replace a plain argument, and a substring hit
+        // (`log` inside `git log --oneline`) would replace the typed word with
+        // one the user never wrote. Select those instead of splicing.
+        if (b.head !== '' && !c.cmd.toLowerCase().startsWith(b.word.toLowerCase())) {
+            suggestSel = i;
+            paintSuggest();
+            return false;
+        }
         cmdInput.value = b.head === '' ? c.cmd + ' ' : b.head + c.cmd.split(' ')[0] + ' ';
         closeSuggest();
         cmdInput.focus();
@@ -1982,10 +1992,16 @@ $wtBoot = [
                 takeSuggest(suggestSel >= 0 ? suggestSel : 0);
                 return;
             }
+            // The list is closed but the word is still completable: Esc, or an
+            // arrow-key recall, which assigns .value without firing `input`.
+            // Hand the prefix hits to takeSuggest so both Tab paths splice
+            // alike, rather than writing cmdInput.value from here.
             const b = currentWordBounds();
             const matches = COMMON_COMMANDS.filter(c => c.cmd.toLowerCase().startsWith(b.word.toLowerCase()));
             if (matches.length === 1) {
-                cmdInput.value = b.head + matches[0].cmd + ' ';
+                suggestMatches = matches;
+                suggestSel = 0;
+                takeSuggest(0);
             } else if (matches.length > 1) {
                 openSuggest(b.word);
             }
