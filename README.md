@@ -193,6 +193,9 @@ python3 webterm_client.py https://example.com/web_terminal.php -c "git pull"
 export WEBTERM_API_KEY=xxxxxxxx
 python3 webterm_client.py https://example.com/web_terminal.php -c "uname -a"
 
+# Or pass the key directly (the env var is preferable - it stays out of shell history):
+python3 webterm_client.py https://example.com/web_terminal.php --api-key xxxx -c "uname -a"
+
 # Upload / download without entering the interactive shell:
 python3 webterm_client.py URL --upload ./build.zip build.zip
 python3 webterm_client.py URL --download remote.log ./remote.log
@@ -223,6 +226,21 @@ running. `cd` persists for the life of the API key or session, including
 between separate one-shot invocations of the CLI when using an API key.
 
 Run `python3 webterm_client.py --help` for all flags.
+
+Environment variables: `WEBTERM_API_KEY` (same as `--api-key`),
+`WEBTERM_USER_AGENT` (override the `User-Agent` header, in case your host's
+WAF blocks the default one).
+
+### Troubleshooting
+
+| Symptom | What it means |
+| --- | --- |
+| `API key login failed: API key authentication is not enabled...` | `TERMINAL_API_KEY_HASH` is still empty on the server. |
+| `API key login failed: Not authenticated...` | The key was received but did not match `TERMINAL_API_KEY_HASH`. Make sure you pass the **raw key**, not the hash. |
+| `Too many failed attempts. Try again in N seconds.` | This IP hit the brute-force lockout (`TERMINAL_MAX_ATTEMPTS`). Wait it out, or raise the limit. |
+| `Server returned HTTP 403 Forbidden...` | The request was blocked before it reached PHP: check `TERMINAL_ALLOWED_IPS`, and any WAF/CDN/mod_security rule in front of the script. |
+| `No credentials received` | The server never saw your key, so the client retries once with the key in the JSON body — useful on hosts that strip custom headers. If it still fails, your host is blocking the request outright. Note the fallback only triggers against a `web_terminal.php` new enough to send that signal. |
+| `Could not reach ...` / connection refused | Wrong URL, or the script isn't deployed there. Note that `web_terminal.php` must be reachable at the exact URL you pass. |
 
 ### Example
 

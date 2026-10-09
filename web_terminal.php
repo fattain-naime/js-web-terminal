@@ -109,6 +109,15 @@ function wt_utf8($s)
     return preg_replace('/[^\x09\x0A\x0D\x20-\x7E]/', '?', $s);
 }
 
+/** Truncate $s to at most $width chars, for hosts without the mbstring extension. */
+function wt_strimwidth($s, $width)
+{
+    if (function_exists('mb_strimwidth')) {
+        return mb_strimwidth($s, 0, $width, '...');
+    }
+    return strlen($s) > $width ? substr($s, 0, $width - 3) . '...' : $s;
+}
+
 function wt_json(array $data, $code = 200)
 {
     http_response_code($code);
@@ -131,6 +140,66 @@ function wt_json(array $data, $code = 200)
 function wt_bad_request($msg, $code = 400)
 {
     wt_json(['ok' => false, 'error' => $msg, 'output' => $msg . "\n"], $code);
+}
+
+define('WT_FATAL_ERRORS', E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR);
+
+/**
+ * Emit a generic JSON 500 for an API/CLI caller whose request died on a PHP
+ * error, instead of the empty body or HTML page PHP produces by default (which
+ * the CLI client can only report as "non-JSON response"). The error text is
+ * deliberately withheld: paths and details belong in the server's error log.
+ */
+function wt_php_error_response()
+{
+    global $wtApiCall;
+    if (empty($wtApiCall) || headers_sent()) {
+        return false;
+    }
+    error_reporting(0);
+    wt_json([
+        'ok'     => false,
+        'error'  => 'The server hit a PHP error while handling this request.',
+        'output' => "The server hit a PHP error while handling this request. "
+            . "Check the web server's error log for details.\n",
+    ], 500);
+    return true;
+}
+
+/** Non-fatal warnings keep the default behaviour, so a partially writable data
+ *  directory degrades gracefully instead of failing the request. */
+function wt_error_handler($severity, $message, $file = null, $line = null)
+{
+    if (!($severity & WT_FATAL_ERRORS)) {
+        return false;
+    }
+    // Returning true below suppresses PHP's own reporting, so log it here first -
+    // otherwise the error log the client is told to check would be empty.
+    error_log($message . ' in ' . $file . ' on line ' . $line);
+    if (!wt_php_error_response()) {
+        return false;
+    }
+    return true;
+}
+
+/** Uncaught exceptions (PHP 7+ turns most fatals into these) bypass the error handler. */
+function wt_exception_handler($e)
+{
+    // Installing this handler suppresses PHP's own "Fatal error: Uncaught ..."
+    // report, so log it here first - otherwise the error log the client is told
+    // to check would be empty.
+    error_log('Uncaught ' . get_class($e) . ': ' . $e->getMessage()
+        . ' in ' . $e->getFile() . ' on line ' . $e->getLine());
+    wt_php_error_response();
+}
+
+/** Catches what neither of the above does: memory exhaustion, timeouts, exit-time fatals. */
+function wt_shutdown_handler()
+{
+    $err = error_get_last();
+    if ($err !== null && ($err['type'] & WT_FATAL_ERRORS)) {
+        wt_php_error_response();
+    }
 }
 
 // ======================= DATA DIRECTORY =======================
@@ -211,7 +280,11 @@ function wt_lock_state($ip)
     if (!is_array($d)) {
         $d = [];
     }
-    return $d + ['count' => 0, 'until' => 0, 'last' => 0];
+    return [
+        'count' => isset($d['count']) ? (int) $d['count'] : 0,
+        'until' => isset($d['until']) ? (int) $d['until'] : 0,
+        'last'  => isset($d['last']) ? (int) $d['last'] : 0,
+    ];
 }
 
 function wt_locked_for($ip)
@@ -257,24 +330,37 @@ function wt_session_destroy()
 }
 
 /**
+ * The API key this request carries, if any. The X-Api-Key header is the
+ * documented path; the body field is a fallback for hosts whose WAF or CGI
+ * setup drops custom headers. An explicit header always wins.
+ */
+function wt_api_key_from_request($input)
+{
+    if (isset($_SERVER['HTTP_X_API_KEY']) && $_SERVER['HTTP_X_API_KEY'] !== '') {
+        return (string) $_SERVER['HTTP_X_API_KEY'];
+    }
+    if (isset($input['api_key']) && is_string($input['api_key']) && $input['api_key'] !== '') {
+        return $input['api_key'];
+    }
+    return '';
+}
+
+/**
  * Resolve who is calling: an API key (stateless, for the CLI) or a browser
- * session (cookie + CSRF). Returns an identity array or null if unauthenticated.
+ * session (cookie + CSRF). Always returns an identity array - on failure,
+ * kind => 'none' with a 'reason' the caller maps to a distinct 401, so the
+ * client can tell a wrong key from a key this server never received.
  */
 function wt_authenticate($input)
 {
-    $apiKey = '';
-    if (isset($_SERVER['HTTP_X_API_KEY'])) {
-        $apiKey = (string) $_SERVER['HTTP_X_API_KEY'];
-    } elseif (isset($input['api_key']) && is_string($input['api_key'])) {
-        $apiKey = $input['api_key'];
-    }
+    $apiKey = wt_api_key_from_request($input);
 
     if ($apiKey !== '') {
         if (!wt_api_key_configured()) {
-            return null;
+            return ['kind' => 'none', 'id' => '', 'needCsrf' => false, 'reason' => 'apikey_not_configured'];
         }
         if (!wt_verify_against_hash($apiKey, TERMINAL_API_KEY_HASH)) {
-            return null;
+            return ['kind' => 'none', 'id' => '', 'needCsrf' => false, 'reason' => 'apikey_rejected'];
         }
         return ['kind' => 'apikey', 'id' => 'apikey', 'needCsrf' => false];
     }
@@ -282,13 +368,13 @@ function wt_authenticate($input)
     if (wt_session_valid()) {
         $token = isset($_SERVER['HTTP_X_CSRF_TOKEN']) ? (string) $_SERVER['HTTP_X_CSRF_TOKEN'] : (isset($input['csrf']) ? (string) $input['csrf'] : '');
         if (empty($_SESSION['csrf']) || !hash_equals($_SESSION['csrf'], $token)) {
-            return null;
+            return ['kind' => 'none', 'id' => '', 'needCsrf' => false, 'reason' => 'csrf_rejected'];
         }
         $_SESSION['last'] = time();
         return ['kind' => 'session', 'id' => 'sess_' . substr(hash('sha256', session_id()), 0, 20), 'needCsrf' => true];
     }
 
-    return null;
+    return ['kind' => 'none', 'id' => '', 'needCsrf' => false, 'reason' => 'no_session'];
 }
 
 // ======================= PER-IDENTITY STATE (cwd / history) =======================
@@ -395,8 +481,9 @@ function wt_pick_executor()
 }
 
 /** Run via proc_open with a timeout. Returns string output, or null if it could not start. */
-function wt_run_proc($script, $timeoutSeconds, $maxBytes)
+function wt_run_proc($script, $timeoutSeconds, $maxBytes, &$exitCode = null)
 {
+    $exitCode = null;
     $windows = wt_is_windows();
     $spec = [
         0 => $windows ? ['pipe', 'r'] : ['file', '/dev/null', 'r'],
@@ -434,6 +521,7 @@ function wt_run_proc($script, $timeoutSeconds, $maxBytes)
         if (strlen($out) > $maxBytes) {
             @proc_terminate($proc, 9);
             $out = substr($out, 0, $maxBytes) . "\n[output truncated]\n";
+            $exitCode = 137;
             break;
         }
         $st = proc_get_status($proc);
@@ -443,29 +531,40 @@ function wt_run_proc($script, $timeoutSeconds, $maxBytes)
                     $out .= $c;
                 }
             }
+            // proc_get_status() only reports the real code on the first call after
+            // the process exits; later calls (and proc_close()) return -1.
+            $exitCode = (int) $st['exitcode'];
             break;
         }
         if (time() - $start >= $timeoutSeconds) {
             @proc_terminate($proc, 9);
             $out .= "\n[timed out after {$timeoutSeconds}s]\n";
+            $exitCode = 124;
             break;
         }
+        // Both pipes closed while proc_get_status() still reports running: a race, so the
+        // only trustworthy code is proc_close()'s. Leaving $exitCode null here
+        // makes the fallback below fill it in without ever claiming success blind.
         if (feof($pipes[1]) && feof($pipes[2])) {
             break;
         }
     }
     fclose($pipes[1]);
     fclose($pipes[2]);
-    proc_close($proc);
+    $closeCode = proc_close($proc);
+    if ($exitCode === null && $closeCode >= 0) {
+        $exitCode = $closeCode;
+    }
     return $out;
 }
 
 /** Run $script to completion with the first usable function. Returns string output or null. */
-function wt_run($script, $timeoutSeconds = 30, $maxBytes = null)
+function wt_run($script, $timeoutSeconds = 30, $maxBytes = null, &$exitCode = null)
 {
     if ($maxBytes === null) {
         $maxBytes = TERMINAL_MAX_OUTPUT;
     }
+    $exitCode = null;
     foreach (wt_executors() as $fn) {
         if (!wt_fn_enabled($fn)) {
             continue;
@@ -473,7 +572,7 @@ function wt_run($script, $timeoutSeconds = 30, $maxBytes = null)
         $out = null;
         switch ($fn) {
             case 'proc_open':
-                $out = wt_run_proc($script, $timeoutSeconds, $maxBytes);
+                $out = wt_run_proc($script, $timeoutSeconds, $maxBytes, $exitCode);
                 break;
             case 'exec':
                 $lines = [];
@@ -727,7 +826,7 @@ function wt_job_list($identityId, $limit = 50)
         list($exitCode, ) = $running ? [null, null] : wt_job_result($id);
         $out[] = [
             'id'      => $id,
-            'command' => mb_strimwidth($meta['command'], 0, 200, '...'),
+            'command' => wt_strimwidth((string) $meta['command'], 200),
             'started' => $meta['started'],
             'running' => $running,
             'exit'    => $exitCode,
@@ -780,17 +879,43 @@ function wt_job_gc()
 // no `cd` persistence or background-job support in this mode - run this
 // script on a Linux/Unix host for the full feature set.
 
-function wt_run_windows_sync($command, $timeoutSeconds, $maxBytes)
+function wt_run_windows_sync($command, $timeoutSeconds, $maxBytes, &$exitCode = null)
 {
-    return wt_run_proc($command . ' 2>&1', $timeoutSeconds, $maxBytes);
+    return wt_run_proc($command . ' 2>&1', $timeoutSeconds, $maxBytes, $exitCode);
 }
 
 // ======================= REQUEST HANDLING =======================
 
-$wtIp = wt_client_ip();
+$wtIp     = wt_client_ip();
+$wtIsPost = isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST';
+
+// An API/CLI caller (POST, an X-Api-Key header, or Accept: application/json) must
+// always get a JSON body back, including on error paths - the CLI client cannot
+// parse an HTML error page, and a bare "Forbidden" with HTTP 403 used to surface
+// as an opaque "Server returned a non-JSON response" instead of telling the user
+// what was wrong.
+$wtApiCall = $wtIsPost
+    || isset($_SERVER['HTTP_X_API_KEY']) && $_SERVER['HTTP_X_API_KEY'] !== ''
+    || stripos(isset($_SERVER['HTTP_ACCEPT']) ? $_SERVER['HTTP_ACCEPT'] : '', 'application/json') !== false;
+
+// Security headers go out before the allow-list check so a rejection carries them too.
+wt_headers_common();
+
+// From here on an API/CLI caller gets JSON for every failure, including warnings
+// and fatals that would otherwise render as an HTML page the client can't parse.
+if ($wtApiCall) {
+    set_error_handler('wt_error_handler');
+    set_exception_handler('wt_exception_handler');
+    register_shutdown_function('wt_shutdown_handler');
+}
+
 if (TERMINAL_ALLOWED_IPS && !in_array($wtIp, TERMINAL_ALLOWED_IPS, true)) {
-    http_response_code(403);
-    exit('Forbidden');
+    $wtForbidden = 'Forbidden: your IP (' . $wtIp . ') is not in TERMINAL_ALLOWED_IPS.';
+    if ($wtApiCall) {
+        wt_json(['ok' => false, 'error' => $wtForbidden, 'output' => $wtForbidden . "\n"], 403);
+    }
+    header('Content-Type: text/plain; charset=utf-8');
+    exit($wtForbidden);
 }
 
 $wtHttps = wt_is_https();
@@ -808,10 +933,8 @@ if (PHP_VERSION_ID >= 70300) {
 session_name('WTSESS');
 session_start();
 
-wt_headers_common();
-
 // ---------------- AJAX / API HANDLER ----------------
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+if ($wtIsPost) {
     $raw   = (string) file_get_contents('php://input');
     $input = json_decode($raw, true);
     if (!is_array($input)) {
@@ -858,17 +981,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // Every other action requires either a valid API key or a valid session.
     $identity = wt_authenticate($input);
-    if ($identity === null) {
+    if ($identity['kind'] === 'none') {
+        $reason = $identity['reason'];
         $wait = wt_locked_for($wtIp);
         if ($wait > 0) {
             wt_json(['ok' => false, 'auth' => false, 'output' => "Too many failed attempts. Try again in {$wait} seconds.\n"], 429);
         }
-        $usedApiKey = isset($_SERVER['HTTP_X_API_KEY']) || (isset($input['api_key']) && $input['api_key'] !== '');
-        if ($usedApiKey) {
+        if ($reason === 'apikey_not_configured') {
+            // Not a wrong key - the server has no key hash at all. Say so, so a
+            // client doesn't send the user hunting for a typo in their key.
+            wt_json([
+                'ok'     => false,
+                'auth'   => false,
+                'error'  => 'API key authentication is not enabled on this server.',
+                'output' => "API key authentication is not enabled: set TERMINAL_API_KEY_HASH "
+                    . "in web_terminal.php on the server, then log in again with --password.\n",
+            ], 401);
+        }
+        // Rate-limit only a key that actually arrived: a request whose header was
+        // stripped before it reached us carries no key and must not be counted.
+        if ($reason === 'apikey_rejected') {
             wt_register_failure($wtIp);
             wt_audit('anon', 'apikey_fail');
+            wt_json(['ok' => false, 'auth' => false, 'output' => "Not authenticated. Log in again or check your API key.\n"], 401);
         }
-        wt_json(['ok' => false, 'auth' => false, 'output' => "Not authenticated. Log in again or check your API key.\n"], 401);
+        if ($reason === 'no_session') {
+            // No credentials arrived at all, which is what a host that strips the
+            // X-Api-Key header looks like. Tell the caller so the CLI can retry the
+            // same key in the request body instead of reporting a bogus rejection.
+            wt_json([
+                'ok'            => false,
+                'auth'          => false,
+                'noCredentials' => true,
+                'output'        => "No credentials received. Log in again, or send the API key "
+                    . "in the JSON body if your host strips the X-Api-Key header.\n",
+            ], 401);
+        }
+        // csrf_rejected: a live session whose CSRF token did not match.
+        wt_json([
+            'ok'     => false,
+            'auth'   => false,
+            'output' => "Not authenticated. Log in again or check your API key.\n",
+        ], 401);
     }
     $identityId = $identity['id'];
 
@@ -993,8 +1147,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             wt_bad_request('File too large to download through this endpoint.', 413);
         }
         wt_audit($identityId, 'download', $src . ' (' . $size . ' bytes)');
+        // Strip anything that could break out of the header (CR/LF, quotes) or
+        // confuse a client: an attacker-chosen filename must not inject headers.
+        $name = preg_replace('/[^\x20-\x7E]|["\\\\]/', '_', basename($src));
         header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="' . basename($src) . '"');
+        header('Content-Disposition: attachment; filename="' . $name . '"');
         header('Content-Length: ' . $size);
         header('Content-Security-Policy: sandbox');
         readfile($src);
@@ -1028,17 +1185,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // No portable backgrounding on Windows: run synchronously with a hard
         // timeout, and no `cd` persistence (see the note above wt_run_windows_sync).
         @set_time_limit(TERMINAL_COMMAND_TIMEOUT + 10);
-        $outRaw = wt_run_windows_sync($command, TERMINAL_COMMAND_TIMEOUT, TERMINAL_MAX_OUTPUT);
+        $exitCode = null;
+        $outRaw = wt_run_windows_sync($command, TERMINAL_COMMAND_TIMEOUT, TERMINAL_MAX_OUTPUT, $exitCode);
         if ($outRaw === null) {
             wt_json(['ok' => false, 'output' => "Could not start the command on this host.\n"]);
         }
-        wt_audit($identityId, 'exec_done', $command);
+        wt_audit($identityId, 'exec_done', trim($command . ' => ' . $exitCode));
         $outRaw = rtrim($outRaw, "\r\n");
         wt_json([
-            'ok'       => true,
+            'ok'       => ($exitCode === 0),
             'state'    => 'done',
             'output'   => $outRaw === '' ? '' : $outRaw . "\n",
-            'exitCode' => null,
+            'exitCode' => $exitCode,
             'cwd'      => $cwd,
             'offset'   => 0,
             'job'      => null,
@@ -1356,7 +1514,11 @@ $wtBoot = [
     } catch (e) { /* storage may be unavailable */ }
 
     function escapeHtml(s) {
-        return s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+        // Quotes matter too: these values are also interpolated into title="..."
+        // attributes, where an unescaped " would end the attribute early.
+        return s.replace(/[&<>"']/g, (c) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
     }
     function appendOutput(text, cls) {
         if (!text) return;
