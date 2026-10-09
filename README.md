@@ -2,7 +2,7 @@
   <img src=".github/banner.svg" alt="Web Terminal — a real shell for shared hosting" width="880">
 </p>
 
-# Web Terminal
+# 🖥️ Web Terminal
 
 **A real terminal for any PHP host that gives you no shell access** — open it in
 your browser for live, streaming output, or drive the very same backend from
@@ -253,16 +253,20 @@ For the full feature set, use a Linux/Unix host.
    commands (`clear`, `exit`, `theme`, `upload`, `download <path>`,
    `jobs`, `cmds`).
 
-Keyboard summary:
+### Keyboard
 
-| Key | What it does |
-| --- | --- |
-| <kbd>Tab</kbd> | Complete the word you're typing / take the highlighted suggestion |
-| <kbd>↑</kbd> / <kbd>↓</kbd> | Move through history, or through the suggestion list while it's open |
-| <kbd>Enter</kbd> | Run the command (never hijacked by the suggestion list) |
-| <kbd>Esc</kbd> | Dismiss the suggestion list |
-| <kbd>Ctrl</kbd>+<kbd>L</kbd> | Clear the screen |
-| <kbd>Ctrl</kbd>+<kbd>C</kbd> | Kill the running job |
+**Autocomplete**
+
+- <kbd>Tab</kbd> — complete the word you're typing, or take the highlighted suggestion
+- <kbd>↑</kbd> / <kbd>↓</kbd> — move to a different suggestion while the list is open
+- <kbd>Esc</kbd> — dismiss the suggestion list
+- <kbd>Enter</kbd> — run what you typed; the suggestion list never swallows it
+
+**Terminal**
+
+- <kbd>↑</kbd> / <kbd>↓</kbd> — previous / next command in history
+- <kbd>Ctrl</kbd>+<kbd>L</kbd> — clear the screen
+- <kbd>Ctrl</kbd>+<kbd>C</kbd> — kill the running job
 
 ### From your own terminal (CLI)
 
