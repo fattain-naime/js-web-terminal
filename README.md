@@ -1,20 +1,54 @@
+<p align="center">
+  <img src=".github/banner.svg" alt="Web Terminal — a real shell for shared hosting" width="880">
+</p>
+
 # Web Terminal
 
-A terminal you can drop into any PHP hosting that doesn't give you shell
-access - usable **two ways at once**:
+**A real terminal for any PHP host that gives you no shell access** — open it in
+your browser for live, streaming output, or drive the very same backend from
+your own terminal with the bundled Python client. Drop `web_terminal.php` into
+your web root, paste in a password hash, and you're running `ls`, `git`,
+`composer` and `docker` on the server. Nothing to install, nothing to build,
+no dependencies.
 
-- **Browser UI** - a dark terminal in your web browser: live (streaming)
-  output for long-running commands, ANSI colors, drag-and-drop file upload,
-  file download, a background-jobs panel, and a system-info panel.
-- **Real terminal (CLI)** - drive the exact same backend from your own
-  terminal with the included `webterm_client.py`: a normal shell-style
-  prompt, persistent `cd`, file upload/download, and scriptable one-shot
-  commands for automation (`webterm_client.py URL -c "git pull"`, usable
-  from cron, CI, or any script).
+<table>
+<tr><td width="50%" valign="top">
 
-The backend and browser UI are one PHP file (`web_terminal.php`); the CLI
-client is one dependency-free Python 3 file (`webterm_client.py`, standard
-library only). Nothing to install on either end.
+### 🖥️ In the browser
+
+A dark, native-feeling terminal that fills the screen and never scrolls the
+page itself:
+
+- **Live output** — anything slow (a `composer install`, a `git clone`) becomes
+  a background job and streams in as it runs.
+- **Common commands** — press <kbd>Tab</kbd> for autocomplete, or type `cmds`
+  for a clickable cheat sheet of the commands you'll actually use.
+- **ANSI colors**, drag-and-drop upload, `download <path>`.
+- **Jobs panel** — list, watch and kill background jobs.
+- **System info panel**, plus dark/light theme and adjustable font size.
+- **Full keyboard control** — `↑`/`↓` history, `Ctrl+L` clear, `Ctrl+C` kill.
+
+</td><td width="50%" valign="top">
+
+### ⌨️ From your own terminal
+
+The same backend, driven by `webterm_client.py` — one dependency-free Python 3
+file, standard library only:
+
+- A familiar shell prompt with persistent `cd`.
+- Upload/download straight from your terminal.
+- **Scriptable one-shots** for cron, CI and automation:
+  `python3 webterm_client.py URL -c "git pull"` — it even exits with the remote
+  command's exit code.
+- **API key** login so no password prompt in unattended jobs.
+
+</td></tr>
+</table>
+
+```
+web_terminal.php   the backend + browser UI, in one file
+webterm_client.py  the CLI client, in one file
+```
 
 ## Features
 
@@ -63,10 +97,44 @@ library only). Nothing to install on either end.
 - **Audit log** - every finished command is logged locally (timestamp, IP,
   identity, exit code, command text - not its output) to a file inside the
   protected data directory.
+- **Built to feel like a native terminal** - the UI fills the viewport and the
+  page itself never scrolls; only the output pane does. It adapts to phone
+  screens and to the on-screen keyboard.
+- **Common commands within reach** - <kbd>Tab</kbd> autocompletes what you're
+  typing, an inline suggestion list appears as you type (<kbd>Tab</kbd> or a
+  click takes the highlighted entry; `↑`/`↓` picks a different one), and
+  `cmds` (or the **Cmds** button) opens a clickable cheat sheet of the
+  everyday commands, with a one-line description each.
 - **Dark/light theme and adjustable font size** in the browser, remembered
   per browser via `localStorage`.
 - **Self-contained** - the whole web app is one PHP file; the CLI client
   is one Python file using only the standard library.
+
+## Contents
+
+- [Features](#features)
+- [Quick start](#quick-start)
+- [Getting started](#getting-started) — prerequisites, full installation, Windows hosts
+- [Usage](#usage) — in the browser, from the CLI, troubleshooting, examples
+- [Configuration](#configuration) — every constant, plus known limitations
+- [Security considerations](#security-considerations)
+- [Contributing](#contributing) · [License](#license)
+
+## Quick start
+
+If you just want it running:
+
+```bash
+git clone https://github.com/fattain-naime/js-web-terminal.git
+cd js-web-terminal
+php -r "echo password_hash('your-password', PASSWORD_DEFAULT), PHP_EOL;"
+# paste the hash into TERMINAL_PASSWORD_HASH in web_terminal.php, then:
+php -S 127.0.0.1:8000 -t .
+```
+
+Open `http://127.0.0.1:8000/web_terminal.php`, log in, and type `help` or
+`cmds`. The full walkthrough — API keys, protecting the data directory, nginx
+and Apache notes — is in [Installation](#installation) below.
 
 ## Getting Started
 
@@ -168,16 +236,33 @@ For the full feature set, use a Linux/Unix host.
 3. Type commands and press `Enter`. Anything slow automatically becomes a
    background job - watch the status bar at the bottom, and use **Kill**
    to stop it.
-4. Drag a file onto the terminal (or click **Upload**) to send it to the
+4. Don't want to remember the exact spelling? Start typing and the
+   suggestion list appears - <kbd>Tab</kbd> accepts the highlighted entry,
+   `↑`/`↓` picks a different one, and clicking works too. <kbd>Enter</kbd>
+   always runs what you typed, just like a real shell. Type `cmds` (or press
+   **Cmds**) for the full cheat sheet, where every common command has a
+   one-line description and a click-to-run button.
+5. Drag a file onto the terminal (or click **Upload**) to send it to the
    current directory. Type `download <path>` to pull a file down.
-5. `Up`/`Down` for history, `Ctrl+L` to clear, `Ctrl+C` to kill the
+6. `Up`/`Down` for history, `Ctrl+L` to clear, `Ctrl+C` to kill the
    currently running job.
-6. Use the **Info** button for a system-info panel, **Jobs** to see/kill/
+7. Use the **Info** button for a system-info panel, **Jobs** to see/kill/
    re-attach to background jobs, **Theme**/**A+**/**A-** for display
    preferences.
-7. Type `help` inside the terminal for the full list of built-in client
+8. Type `help` inside the terminal for the full list of built-in client
    commands (`clear`, `exit`, `theme`, `upload`, `download <path>`,
-   `jobs`).
+   `jobs`, `cmds`).
+
+Keyboard summary:
+
+| Key | What it does |
+| --- | --- |
+| <kbd>Tab</kbd> | Complete the word you're typing / take the highlighted suggestion |
+| <kbd>↑</kbd> / <kbd>↓</kbd> | Move through history, or through the suggestion list while it's open |
+| <kbd>Enter</kbd> | Run the command (never hijacked by the suggestion list) |
+| <kbd>Esc</kbd> | Dismiss the suggestion list |
+| <kbd>Ctrl</kbd>+<kbd>L</kbd> | Clear the screen |
+| <kbd>Ctrl</kbd>+<kbd>C</kbd> | Kill the running job |
 
 ### From your own terminal (CLI)
 
