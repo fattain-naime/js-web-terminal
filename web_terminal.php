@@ -1296,21 +1296,26 @@ $wtBoot = [
             --ok: #1f9a53;
         }
         * { box-sizing: border-box; }
+        /* Full-viewport, fixed terminal: the page itself never scrolls - only
+           the output pane does, which is what a native terminal feels like. */
+        html, body { height: 100%; overflow: hidden; overscroll-behavior: none; }
         body {
             margin: 0;
-            padding: 0;
+            padding: 10px;
             background: var(--bg);
             color: var(--text);
             font-family: 'Courier New', monospace;
             height: 100vh;
+            height: 100dvh;
             display: flex;
             justify-content: center;
-            align-items: center;
+            align-items: stretch;
         }
         .terminal-container {
-            width: 95%;
-            max-width: 1100px;
-            height: 88vh;
+            width: 100%;
+            max-width: 1200px;
+            flex: 1 1 auto;
+            min-height: 0;
             background: var(--panel);
             border-radius: 8px;
             box-shadow: 0 8px 16px rgba(0, 0, 0, 0.4);
@@ -1320,18 +1325,19 @@ $wtBoot = [
             position: relative;
         }
         .terminal-header {
-            padding: 10px 15px;
+            padding: 6px 12px;
             background: var(--panel2);
             color: var(--muted);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            font-size: 14px;
+            font-size: 13px;
             flex-wrap: wrap;
-            gap: 6px;
+            gap: 4px;
+            flex: 0 0 auto;
         }
-        .terminal-header .title { font-weight: bold; color: var(--text); }
-        .right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .terminal-header .title { font-weight: bold; color: var(--text); white-space: nowrap; }
+        .right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
         .icon-btn {
             background: transparent;
             color: var(--muted);
@@ -1345,7 +1351,7 @@ $wtBoot = [
         .icon-btn:hover { color: var(--text); border-color: var(--accent); }
         .icon-btn.danger:hover { color: var(--err); border-color: var(--err); }
         .logout-btn { display: none; }
-        .panels { display: none; border-bottom: 1px solid var(--border); background: var(--out-bg); max-height: 40%; overflow-y: auto; }
+        .panels { display: none; border-bottom: 1px solid var(--border); background: var(--out-bg); max-height: 40%; overflow-y: auto; flex: 0 1 auto; }
         .panels.open { display: block; }
         .panel { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 12.5px; }
         .panel h4 { margin: 0 0 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
@@ -1359,28 +1365,64 @@ $wtBoot = [
         .job-status.running { color: var(--ok); border-color: var(--ok); }
         .job-row .icon-btn { padding: 1px 6px; font-size: 11px; }
         .terminal-output {
-            flex: 1;
-            padding: 10px;
+            flex: 1 1 auto;
+            /* min-height:0 is what lets a flex child shrink and scroll instead
+               of pushing the page taller than the viewport. */
+            min-height: 0;
+            padding: 10px 12px;
             overflow-y: auto;
+            overflow-x: hidden;
             background: var(--out-bg);
             color: var(--text);
             font-size: 14px;
+            line-height: 1.35;
             white-space: pre-wrap;
             word-break: break-word;
+            scrollbar-width: thin;
+            scrollbar-color: var(--border) transparent;
         }
+        .terminal-output::-webkit-scrollbar { width: 10px; }
+        .terminal-output::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+        .terminal-output::-webkit-scrollbar-track { background: transparent; }
         .terminal-output .err { color: var(--err); }
         .terminal-output .ok { color: var(--ok); }
         .terminal-output .sys { color: var(--dim); }
-        .runbar { display: none; align-items: center; gap: 8px; padding: 6px 12px; background: var(--panel2); border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+        .runbar { display: none; align-items: center; gap: 8px; padding: 6px 12px; background: var(--panel2); border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); flex: 0 0 auto; }
         .runbar.show { display: flex; }
-        .spinner { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--accent); animation: spin .8s linear infinite; }
+        .spinner { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--accent); animation: spin .8s linear infinite; flex: 0 0 auto; }
         @keyframes spin { to { transform: rotate(360deg); } }
+        .suggest {
+            display: none;
+            background: var(--panel2);
+            border-top: 1px solid var(--border);
+            max-height: 40%;
+            overflow-y: auto;
+            flex: 0 1 auto;
+        }
+        .suggest.open { display: block; }
+        .suggest-item {
+            display: flex;
+            gap: 10px;
+            align-items: baseline;
+            padding: 5px 12px;
+            font-size: 13px;
+            cursor: pointer;
+            border-bottom: 1px solid transparent;
+        }
+        .suggest-item:last-child { border-bottom: none; }
+        .suggest-item .c { color: var(--text); white-space: nowrap; }
+        .suggest-item .d { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .suggest-item.sel { background: var(--accent); }
+        .suggest-item.sel .c, .suggest-item.sel .d { color: #fff; }
+        .suggest-item mark { background: transparent; color: var(--accent); font-weight: bold; }
+        .suggest-item.sel mark { color: #fff; text-decoration: underline; }
         .terminal-input {
             display: flex;
-            padding: 10px;
+            padding: 8px 10px;
             background: var(--panel2);
             border-top: 1px solid var(--border);
             align-items: center;
+            flex: 0 0 auto;
         }
         .terminal-input .prompt {
             margin-right: 8px;
@@ -1426,11 +1468,21 @@ $wtBoot = [
         .login-error { color: var(--err); font-size: 13px; display: none; }
         .login-hint { color: var(--muted); font-size: 12px; display: none; text-align: center; }
         .terminal-footer {
-            padding: 8px 12px; background: var(--panel2); color: var(--muted);
-            font-size: 13px; text-align: right; border-top: 1px solid var(--border); user-select: none;
+            padding: 5px 12px; background: var(--panel2); color: var(--muted);
+            font-size: 12px; text-align: right; border-top: 1px solid var(--border); user-select: none;
+            flex: 0 0 auto;
         }
         .terminal-footer a { color: #8fb1ff; text-decoration: none; font-weight: 600; }
         .terminal-footer a:hover { text-decoration: underline; }
+        /* Phone layout. Kept last so the overrides below win the cascade:
+           a media query adds no specificity, only source order decides. */
+        @media (max-width: 640px) {
+            body { padding: 0; }
+            .terminal-container { border-radius: 0; box-shadow: none; }
+            /* Whole row is one tap target on phones, still compact on desktop. */
+            .icon-btn { padding: 6px 10px; font-size: 13px; }
+            .terminal-footer { font-size: 11px; padding: 5px 10px; }
+        }
     </style>
 </head>
 <body>
@@ -1438,6 +1490,7 @@ $wtBoot = [
     <div class="terminal-header">
         <div class="title">Web Terminal</div>
         <div class="right">
+            <button class="icon-btn" id="cmdsBtn" type="button" title="Show common commands">Cmds</button>
             <button class="icon-btn" id="infoBtn" type="button" title="System info">Info</button>
             <button class="icon-btn" id="jobsBtn" type="button" title="Background jobs">Jobs</button>
             <button class="icon-btn" id="uploadBtn" type="button" title="Upload a file">Upload</button>
@@ -1455,9 +1508,10 @@ $wtBoot = [
         <span id="runbarText">Running...</span>
         <button class="icon-btn danger" id="killBtn" type="button" style="margin-left:auto;">Kill</button>
     </div>
+    <div class="suggest" id="suggest"></div>
     <div class="terminal-input">
         <span class="prompt" id="promptEl">$</span>
-        <input type="text" id="commandInput" placeholder="Type a command... (try: help)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" disabled />
+        <input type="text" id="commandInput" placeholder="Type a command... (Tab completes, ↑↓ history)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" disabled />
     </div>
     <input type="file" id="fileInput" style="display:none" multiple />
     <div class="drop-hint" id="dropHint">Drop file to upload to the current directory</div>
@@ -1487,6 +1541,7 @@ $wtBoot = [
     const runbar = el('runbar');
     const runbarText = el('runbarText');
     const killBtn = el('killBtn');
+    const suggestEl = el('suggest');
     const dropHint = el('dropHint');
     const fileInput = el('fileInput');
     const container = el('container');
@@ -1505,6 +1560,57 @@ $wtBoot = [
     let pollTimer = null;
     let history = [];
     let historyIndex = -1;
+
+    // ---- Common commands ----
+    // A curated starter set so the usual things are one keystroke away instead
+    // of something you have to remember and spell out. Purely a client-side
+    // shortcut list: anything not in here is still a normal server command.
+    const COMMON_COMMANDS = [
+        { cmd: 'help', desc: 'List built-in commands' },
+        { cmd: 'clear', desc: 'Clear the screen' },
+        { cmd: 'pwd', desc: 'Print the current directory' },
+        { cmd: 'ls', desc: 'List files' },
+        { cmd: 'ls -la', desc: 'List files, long format, hidden too' },
+        { cmd: 'cd ..', desc: 'Go up one directory' },
+        { cmd: 'cat', desc: 'Print a file' },
+        { cmd: 'head', desc: 'First lines of a file' },
+        { cmd: 'tail', desc: 'Last lines of a file' },
+        { cmd: 'tail -f', desc: 'Follow a log file live' },
+        { cmd: 'grep -rn', desc: 'Search recursively for a string' },
+        { cmd: 'find', desc: 'Find files by name' },
+        { cmd: 'mkdir -p', desc: 'Create a directory tree' },
+        { cmd: 'cp -r', desc: 'Copy a file or directory' },
+        { cmd: 'mv', desc: 'Move or rename' },
+        { cmd: 'rm -rf', desc: 'Delete recursively, no prompt' },
+        { cmd: 'chmod', desc: 'Change file permissions' },
+        { cmd: 'du -sh', desc: 'Size of a directory' },
+        { cmd: 'df -h', desc: 'Free disk space' },
+        { cmd: 'ps aux', desc: 'Running processes' },
+        { cmd: 'kill', desc: 'Signal a process by PID' },
+        { cmd: 'uname -a', desc: 'Kernel and system info' },
+        { cmd: 'whoami', desc: 'Current user' },
+        { cmd: 'uptime', desc: 'Load average and uptime' },
+        { cmd: 'free -h', desc: 'Memory usage' },
+        { cmd: 'date', desc: 'Current date and time' },
+        { cmd: 'history', desc: 'Shared command history' },
+        { cmd: 'jobs', desc: 'Background jobs for this identity' },
+        { cmd: 'echo', desc: 'Print text' },
+        { cmd: 'tar -czf', desc: 'Create a .tar.gz archive' },
+        { cmd: 'unzip', desc: 'Extract a zip archive' },
+        { cmd: 'php -v', desc: 'PHP version on the server' },
+        { cmd: 'composer install', desc: 'Install PHP dependencies' },
+        { cmd: 'npm install', desc: 'Install Node dependencies' },
+        { cmd: 'node -v', desc: 'Node version' },
+        { cmd: 'git status', desc: 'Working tree status' },
+        { cmd: 'git log --oneline', desc: 'Recent commits, one per line' },
+        { cmd: 'git pull', desc: 'Pull remote changes' },
+        { cmd: 'docker ps', desc: 'Running containers' },
+        { cmd: 'systemctl restart', desc: 'Restart a service' },
+        { cmd: 'upload', desc: 'Pick a file to upload here' },
+        { cmd: 'download', desc: 'Download a remote file (download <path>)' },
+        { cmd: 'theme', desc: 'Toggle dark/light' },
+        { cmd: 'exit', desc: 'Log out' },
+    ];
 
     try {
         const savedTheme = localStorage.getItem('wt_theme');
@@ -1639,6 +1745,7 @@ $wtBoot = [
         currentJob = null;
         cmdInput.disabled = true;
         cmdInput.value = '';
+        closeSuggest();
         logoutBtn.style.display = 'none';
         statusText.textContent = 'Not Authenticated';
         loginOverlay.style.display = 'flex';
@@ -1746,7 +1853,10 @@ $wtBoot = [
         if (name === 'exit' || name === 'logout') { performLogout(); return true; }
         if (name === 'help') {
             appendOutput(
-                'Built-in: clear, exit, help, theme, upload, download <path>, jobs, history\n' +
+                'Built-in: clear, exit, help, theme, upload, download <path>, jobs, cmds, history\n' +
+                'cmds          show the common command cheat sheet (click one to run it)\n' +
+                'Tab           complete the word you are typing; ↑↓ pick a suggestion\n' +
+                'Ctrl+L        clear screen      Ctrl+C  kill the running job\n' +
                 'Real shell commands (ls, pwd, git, php, composer, ...) run on the server.\n' +
                 'Long-running commands become a background job automatically - watch the status bar.\n' +
                 'This same server also has a CLI client: see webterm_client.py in the repo.\n\n',
@@ -1757,13 +1867,15 @@ $wtBoot = [
         if (name === 'theme') { toggleTheme(); return true; }
         if (name === 'upload') { fileInput.click(); return true; }
         if (name === 'jobs') { togglePanel('jobs'); return true; }
+        if (name === 'cmds' || name === 'commands') { togglePanel('cmds'); return true; }
         if (name === 'download' && parts[1]) { triggerDownload(parts.slice(1).join(' ')); return true; }
         return false;
     }
 
     async function runCommand(command) {
         const cmd = command.trim();
-        if (!cmd) return;
+        if (!cmd || busy) return;
+        closeSuggest();
         if (clientSideCommand(cmd)) return;
         appendOutput(promptText() + ' ' + command + '\n');
         busy = true;
@@ -1791,8 +1903,123 @@ $wtBoot = [
         }
     }
 
+    // ---- Suggestions ----
+    // Offers matching common commands while typing; Tab or a click takes the
+    // highlighted one. Enter always runs the line, the way a terminal does.
+    let suggestMatches = [];
+    let suggestSel = -1;
+
+    function currentWordBounds() {
+        const v = cmdInput.value;
+        let start = v.length;
+        while (start > 0 && !/\s/.test(v[start - 1])) start--;
+        return { word: v.slice(start), head: v.slice(0, start) };
+    }
+    function rankMatches(word) {
+        const w = word.toLowerCase();
+        if (!w) return [];
+        const starts = [], contains = [];
+        for (const c of COMMON_COMMANDS) {
+            const cl = c.cmd.toLowerCase();
+            if (cl === w) continue;
+            if (cl.startsWith(w)) starts.push(c);
+            else if (cl.includes(w)) contains.push(c);
+        }
+        return starts.concat(contains).slice(0, 8);
+    }
+    function highlight(cmd, word) {
+        const i = cmd.toLowerCase().indexOf(word.toLowerCase());
+        if (word && i >= 0) {
+            return escapeHtml(cmd.slice(0, i)) + '<mark>' + escapeHtml(cmd.slice(i, i + word.length)) + '</mark>' + escapeHtml(cmd.slice(i + word.length));
+        }
+        return escapeHtml(cmd);
+    }
+    function closeSuggest() {
+        suggestEl.classList.remove('open');
+        suggestEl.innerHTML = '';
+        suggestMatches = [];
+        suggestSel = -1;
+    }
+    function paintSuggest() {
+        if (!suggestMatches.length) { closeSuggest(); return; }
+        suggestEl.innerHTML = suggestMatches.map((c, i) =>
+            '<div class="suggest-item' + (i === suggestSel ? ' sel' : '') + '">' +
+            '<span class="c">' + highlight(c.cmd, currentWordBounds().word) + '</span>' +
+            '<span class="d">' + escapeHtml(c.desc) + '</span></div>'
+        ).join('');
+        suggestEl.classList.add('open');
+        // innerHTML was just replaced, so scrollTop resets - keep the
+        // highlighted row visible on short viewports.
+        const sel = suggestEl.querySelector('.suggest-item.sel');
+        if (sel) sel.scrollIntoView({ block: 'nearest' });
+    }
+    function openSuggest(word) {
+        suggestMatches = rankMatches(word);
+        suggestSel = suggestMatches.length ? 0 : -1;
+        paintSuggest();
+    }
+    function takeSuggest(i) {
+        const c = suggestMatches[i];
+        if (!c) return false;
+        const b = currentWordBounds();
+        // Entries are whole commands like `git log --oneline`, so only splice
+        // one in where a whole command belongs: at the start of the line.
+        // Anywhere else it would replace a plain argument, and a substring hit
+        // (`log` inside `git log --oneline`) would replace the typed word with
+        // one the user never wrote. Select those instead of splicing.
+        if (b.head !== '' && !c.cmd.toLowerCase().startsWith(b.word.toLowerCase())) {
+            suggestSel = i;
+            paintSuggest();
+            return false;
+        }
+        cmdInput.value = b.head === '' ? c.cmd + ' ' : b.head + c.cmd.split(' ')[0] + ' ';
+        closeSuggest();
+        cmdInput.focus();
+        return true;
+    }
+    suggestEl.addEventListener('mousedown', (e) => {
+        const item = e.target.closest('.suggest-item');
+        if (!item) return;
+        e.preventDefault();
+        takeSuggest(Array.prototype.indexOf.call(suggestEl.children, item));
+    });
+    cmdInput.addEventListener('input', () => openSuggest(currentWordBounds().word));
+
     cmdInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Tab' && !e.ctrlKey && !e.altKey) {
+            e.preventDefault();
+            if (suggestMatches.length) {
+                takeSuggest(suggestSel >= 0 ? suggestSel : 0);
+                return;
+            }
+            // The list is closed but the word is still completable: Esc, or an
+            // arrow-key recall, which assigns .value without firing `input`.
+            // Hand the prefix hits to takeSuggest so both Tab paths splice
+            // alike, rather than writing cmdInput.value from here.
+            const b = currentWordBounds();
+            const matches = COMMON_COMMANDS.filter(c => c.cmd.toLowerCase().startsWith(b.word.toLowerCase()));
+            if (matches.length === 1) {
+                suggestMatches = matches;
+                suggestSel = 0;
+                takeSuggest(0);
+            } else if (matches.length > 1) {
+                openSuggest(b.word);
+            }
+            return;
+        }
+        if (suggestMatches.length && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+            e.preventDefault();
+            const dir = e.key === 'ArrowDown' ? 1 : -1;
+            suggestSel = (suggestSel + dir + suggestMatches.length) % suggestMatches.length;
+            paintSuggest();
+            return;
+        }
+        if (e.key === 'Escape' && suggestMatches.length) {
+            closeSuggest();
+            return;
+        }
         if (e.key === 'Enter') {
+            closeSuggest();
             if (busy) return;
             const cmd = cmdInput.value;
             if (cmd.trim() && history[history.length - 1] !== cmd) history.push(cmd);
@@ -1804,9 +2031,11 @@ $wtBoot = [
         } else if (e.key === 'c' && e.ctrlKey && currentJob) {
             e.preventDefault(); doKill();
         } else if (e.key === 'ArrowUp') {
+            closeSuggest();
             if (historyIndex > 0) { historyIndex--; cmdInput.value = history[historyIndex] || ''; setTimeout(() => cmdInput.setSelectionRange(cmdInput.value.length, cmdInput.value.length), 0); }
             e.preventDefault();
         } else if (e.key === 'ArrowDown') {
+            closeSuggest();
             if (historyIndex < history.length - 1) { historyIndex++; cmdInput.value = history[historyIndex] || ''; }
             else { historyIndex = history.length; cmdInput.value = ''; }
             e.preventDefault();
@@ -1855,6 +2084,19 @@ $wtBoot = [
                 '</table></div>';
         } else if (name === 'jobs') {
             await refreshJobs();
+        } else if (name === 'cmds') {
+            panelsEl.innerHTML = '<div class="panel"><h4>Common commands</h4>' +
+                COMMON_COMMANDS.map(c => '<div class="suggest-item" data-run="' + escapeHtml(c.cmd) + '">' +
+                '<span class="c">' + escapeHtml(c.cmd) + '</span>' +
+                '<span class="d">- ' + escapeHtml(c.desc) + '</span></div>').join('') +
+                '</div>';
+            panelsEl.querySelectorAll('[data-run]').forEach(b => b.addEventListener('click', () => {
+                const cmd = b.getAttribute('data-run');
+                if (cmdInput.disabled) return;   // a job is running
+                if (history[history.length - 1] !== cmd) history.push(cmd);
+                historyIndex = history.length;
+                runCommand(cmd);
+            }));
         }
     }
     async function refreshJobs() {
@@ -1883,6 +2125,7 @@ $wtBoot = [
     }
     el('infoBtn').addEventListener('click', () => togglePanel('info'));
     el('jobsBtn').addEventListener('click', () => togglePanel('jobs'));
+    el('cmdsBtn').addEventListener('click', () => togglePanel('cmds'));
 
     // ---- Upload / download ----
     function fileToBase64(file) {
@@ -1929,7 +2172,7 @@ $wtBoot = [
     }
 
     // Initial greeting
-    appendOutput('Web Terminal Pro - type commands after login. Type "help" once logged in.\n', 'sys');
+    appendOutput('Web Terminal Pro - type commands after login, or "help" / "cmds" for the command list.\n', 'sys');
     if (!BOOT.https) appendOutput('WARNING: this page is not served over HTTPS. Credentials and commands can be intercepted.\n', 'err');
     if (!BOOT.configured) appendOutput('Setup required: set TERMINAL_PASSWORD_HASH in web_terminal.php (see README).\n', 'err');
     if (!BOOT.apiKey) appendOutput('Tip: set TERMINAL_API_KEY_HASH to also use the CLI client (webterm_client.py).\n', 'sys');

@@ -1,22 +1,56 @@
-# Web Terminal
+<p align="center">
+  <img src=".github/banner.svg" alt="Web Terminal — a real shell for shared hosting" width="880">
+</p>
 
-A terminal you can drop into any PHP hosting that doesn't give you shell
-access - usable **two ways at once**:
+# 🖥️ Web Terminal
 
-- **Browser UI** - a dark terminal in your web browser: live (streaming)
-  output for long-running commands, ANSI colors, drag-and-drop file upload,
-  file download, a background-jobs panel, and a system-info panel.
-- **Real terminal (CLI)** - drive the exact same backend from your own
-  terminal with the included `webterm_client.py`: a normal shell-style
-  prompt, persistent `cd`, file upload/download, and scriptable one-shot
-  commands for automation (`webterm_client.py URL -c "git pull"`, usable
-  from cron, CI, or any script).
+**A real terminal for any PHP host that gives you no shell access** — open it in
+your browser for live, streaming output, or drive the very same backend from
+your own terminal with the bundled Python client. Drop `web_terminal.php` into
+your web root, paste in a password hash, and you're running `ls`, `git`,
+`composer` and `docker` on the server. Nothing to install, nothing to build,
+no dependencies.
 
-The backend and browser UI are one PHP file (`web_terminal.php`); the CLI
-client is one dependency-free Python 3 file (`webterm_client.py`, standard
-library only). Nothing to install on either end.
+## 🎯 Two ways in
 
-## Features
+One backend, two front doors — both modes talk to the same API, and share the
+same working directory and command history for a given login. Use whichever
+suits the moment.
+
+### 🖥️ Browser UI
+
+A dark, native-feeling terminal that fills the screen and never scrolls the
+page itself:
+
+- **Live output** — anything slow (a `composer install`, a `git clone`) becomes
+  a background job and streams in as it runs.
+- **Common commands** — press <kbd>Tab</kbd> for autocomplete, or type `cmds`
+  for a clickable cheat sheet of the commands you'll actually use.
+- **ANSI colors**, drag-and-drop upload, `download <path>`.
+- **Jobs panel** — list, watch and kill background jobs.
+- **System info panel**, plus dark/light theme and adjustable font size.
+- **Full keyboard control** — `↑`/`↓` history, `Ctrl+L` clear, `Ctrl+C` kill.
+
+### ⌨️ CLI client
+
+The same backend, driven by `webterm_client.py` — one dependency-free Python 3
+file, standard library only:
+
+- A familiar shell prompt with persistent `cd`.
+- Upload/download straight from your terminal.
+- **Scriptable one-shots** for cron, CI and automation:
+  `python3 webterm_client.py URL -c "git pull"` — it even exits with the remote
+  command's exit code.
+- **API key** login so no password prompt in unattended jobs.
+
+And that is the whole thing — two files, no dependencies:
+
+```
+web_terminal.php   the backend + browser UI, in one file
+webterm_client.py  the CLI client, in one file
+```
+
+## ✨ Features
 
 - **Dual mode** - use the browser, or run `webterm_client.py` from your own
   terminal against the same deployment. Both talk to the same JSON API, and
@@ -63,14 +97,49 @@ library only). Nothing to install on either end.
 - **Audit log** - every finished command is logged locally (timestamp, IP,
   identity, exit code, command text - not its output) to a file inside the
   protected data directory.
+- **Built to feel like a native terminal** - the UI fills the viewport and the
+  page itself never scrolls; only the output pane does. It adapts to phone
+  screens and to the on-screen keyboard.
+- **Common commands within reach** - <kbd>Tab</kbd> autocompletes what you're
+  typing, an inline suggestion list appears as you type (<kbd>Tab</kbd> or a
+  click takes the highlighted entry; `↑`/`↓` picks a different one), and
+  `cmds` (or the **Cmds** button) opens a clickable cheat sheet of the
+  everyday commands, with a one-line description each.
 - **Dark/light theme and adjustable font size** in the browser, remembered
   per browser via `localStorage`.
 - **Self-contained** - the whole web app is one PHP file; the CLI client
   is one Python file using only the standard library.
 
-## Getting Started
+## 🗺️ Contents
 
-### Prerequisites
+- [Two ways in](#two-ways-in) — the browser UI and the CLI client
+- [Features](#features)
+- [Quick start](#quick-start)
+- [Getting started](#getting-started) — prerequisites, full installation, Windows hosts
+- [Usage](#usage) — in the browser, keyboard, from the CLI, troubleshooting, examples
+- [Configuration](#configuration) — every constant, plus known limitations
+- [Security considerations](#security-considerations)
+- [Contributing](#contributing) · [License](#license)
+
+## 🚀 Quick start
+
+If you just want it running:
+
+```bash
+git clone https://github.com/fattain-naime/js-web-terminal.git
+cd js-web-terminal
+php -r "echo password_hash('your-password', PASSWORD_DEFAULT), PHP_EOL;"
+# paste the hash into TERMINAL_PASSWORD_HASH in web_terminal.php, then:
+php -S 127.0.0.1:8000 -t .
+```
+
+Open `http://127.0.0.1:8000/web_terminal.php`, log in, and type `help` or
+`cmds`. The full walkthrough — API keys, protecting the data directory, nginx
+and Apache notes — is in [Installation](#installation) below.
+
+## 🛠️ Getting Started
+
+### 📦 Prerequisites
 
 - A web server capable of running PHP (PHP 7.0+; a Linux/Unix host is
   needed for background jobs - see **Windows hosts** below). PHP's
@@ -78,7 +147,7 @@ library only). Nothing to install on either end.
 - Python 3 on your own machine if you want to use the CLI client - no
   extra packages needed.
 
-### Installation
+### 📥 Installation
 
 1. Clone or download this repository to your web server's document root:
 
@@ -148,7 +217,7 @@ library only). Nothing to install on either end.
    the top of the file) to a path **outside** the document root entirely,
    if your hosting lets you write there.
 
-### Windows hosts
+### 🪟 Windows hosts
 
 The background-job engine (and therefore `cd` persistence and job
 list/kill) relies on POSIX shell features (`setsid`, `nohup`, process
@@ -159,27 +228,48 @@ version of this script worked - no `cd` persistence, no background jobs.
 Everything else (login, API key, upload/download, audit log) still works.
 For the full feature set, use a Linux/Unix host.
 
-## Usage
+## 🎮 Usage
 
-### In the browser
+### 🖥️ In the browser
 
 1. Open the script URL. You'll see a login overlay.
 2. Enter your password and click **Login**.
 3. Type commands and press `Enter`. Anything slow automatically becomes a
    background job - watch the status bar at the bottom, and use **Kill**
    to stop it.
-4. Drag a file onto the terminal (or click **Upload**) to send it to the
+4. Don't want to remember the exact spelling? Start typing and the
+   suggestion list appears - <kbd>Tab</kbd> accepts the highlighted entry,
+   `↑`/`↓` picks a different one, and clicking works too. <kbd>Enter</kbd>
+   always runs what you typed, just like a real shell. Type `cmds` (or press
+   **Cmds**) for the full cheat sheet, where every common command has a
+   one-line description and a click-to-run button.
+5. Drag a file onto the terminal (or click **Upload**) to send it to the
    current directory. Type `download <path>` to pull a file down.
-5. `Up`/`Down` for history, `Ctrl+L` to clear, `Ctrl+C` to kill the
+6. `Up`/`Down` for history, `Ctrl+L` to clear, `Ctrl+C` to kill the
    currently running job.
-6. Use the **Info** button for a system-info panel, **Jobs** to see/kill/
+7. Use the **Info** button for a system-info panel, **Jobs** to see/kill/
    re-attach to background jobs, **Theme**/**A+**/**A-** for display
    preferences.
-7. Type `help` inside the terminal for the full list of built-in client
+8. Type `help` inside the terminal for the full list of built-in client
    commands (`clear`, `exit`, `theme`, `upload`, `download <path>`,
-   `jobs`).
+   `jobs`, `cmds`).
 
-### From your own terminal (CLI)
+### ⌨️ Keyboard
+
+**Autocomplete**
+
+- <kbd>Tab</kbd> — complete the word you're typing, or take the highlighted suggestion
+- <kbd>↑</kbd> / <kbd>↓</kbd> — move to a different suggestion while the list is open
+- <kbd>Esc</kbd> — dismiss the suggestion list
+- <kbd>Enter</kbd> — run what you typed; the suggestion list never swallows it
+
+**Terminal**
+
+- <kbd>↑</kbd> / <kbd>↓</kbd> — previous / next command in history
+- <kbd>Ctrl</kbd>+<kbd>L</kbd> — clear the screen
+- <kbd>Ctrl</kbd>+<kbd>C</kbd> — kill the running job
+
+### 💻 From your own terminal (CLI)
 
 ```bash
 # Interactive shell, prompts for your password:
@@ -231,7 +321,7 @@ Environment variables: `WEBTERM_API_KEY` (same as `--api-key`),
 `WEBTERM_USER_AGENT` (override the `User-Agent` header, in case your host's
 WAF blocks the default one).
 
-### Troubleshooting
+### 🩺 Troubleshooting
 
 | Symptom | What it means |
 | --- | --- |
@@ -242,7 +332,7 @@ WAF blocks the default one).
 | `No credentials received` | The server never saw your key, so the client retries once with the key in the JSON body — useful on hosts that strip custom headers. If it still fails, your host is blocking the request outright. Note the fallback only triggers against a `web_terminal.php` new enough to send that signal. |
 | `Could not reach ...` / connection refused | Wrong URL, or the script isn't deployed there. Note that `web_terminal.php` must be reachable at the exact URL you pass. |
 
-### Example
+### 🧪 Example
 
 After logging in (either mode), try:
 
@@ -253,7 +343,7 @@ php -v               # show the PHP version running on the server
 composer install     # a slow command - becomes a background job automatically
 ```
 
-## Configuration
+## ⚙️ Configuration
 
 All options are constants near the top of `web_terminal.php`:
 
@@ -282,7 +372,7 @@ second, shared identity (so all CLI invocations using the same key share
 one `cd` history - handy for scripting, since `cd /some/project` in one
 CLI call is still in effect on the next).
 
-### Known limitations
+### 🚧 Known limitations
 
 - Environment variables set with `export` do **not** persist between
   separate commands (only the working directory does) - each command
@@ -300,7 +390,7 @@ CLI call is still in effect on the next).
 - No background jobs, `cd` persistence, or kill on Windows hosts (see
   **Windows hosts** above).
 
-## Security Considerations
+## 🔒 Security Considerations
 
 This project intentionally removes command restrictions to provide
 maximum flexibility. As a result, **it will execute any command** the
@@ -325,12 +415,12 @@ authenticated user or API key supplies. Keep in mind:
 If you need a more constrained environment, consider reintroducing an
 allow-list of safe commands.
 
-## Contributing
+## 🤝 Contributing
 
 Pull requests are welcome! If you have ideas for improvements - additional
 authentication mechanisms, more client commands, UI enhancements - feel
 free to open an issue or submit a PR.
 
-## License
+## 📜 License
 
 This project is licensed under the GPL v2.0 License. See the [LICENSE](https://github.com/fattain-naime/js-web-terminal/blob/main/LICENSE) file for details.
