@@ -1,0 +1,25 @@
+# Example Apache config for the folder holding web_terminal.php.
+# Copy to .htaccess in that folder (and adjust) if your host uses Apache.
+
+# Block direct access to .webterm_data/ (job logs, command history, the
+# audit log) and any other dotfile here. web_terminal.php already writes
+# its own .htaccess inside .webterm_data/, but Apache only honors that if
+# AllowOverride permits it there - this is defense in depth, and the only
+# protection at all if your host's web server is not Apache (see README).
+# This matches the request path: <FilesMatch> only sees the basename, so on
+# its own it would let /.webterm_data/jobs/<id>.log through untouched. The
+# lookahead spares /.well-known/, where ACME challenge files live.
+RedirectMatch 404 "(?:^|/)\.(?!well-known/)"
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>
+
+# Force HTTPS. Comment this out if TLS is already terminated by a proxy
+# in front of this host and HTTPS can't be detected here. Wrapped in
+# <IfModule> so a host without mod_rewrite skips the redirect instead of
+# erroring out with a 500 for every file in this folder.
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteCond %{HTTPS} off
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+</IfModule>
