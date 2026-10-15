@@ -312,6 +312,10 @@ class WebTermClient:
             try:
                 while not done.is_set():
                     time.sleep(POLL_INTERVAL)
+                    # A kill may have landed during the sleep - don't start a
+                    # poll the stream is no longer waiting for.
+                    if done.is_set():
+                        return
                     try:
                         pdata = self.post('poll', timeout=POLL_TIMEOUT, job=job, offset=offset)
                     except AuthError as e:
@@ -332,6 +336,11 @@ class WebTermClient:
                         time.sleep(POLL_RETRY_DELAY)
                         continue
                     transient = 0
+                    # A kill can also land while this poll is in flight; the
+                    # stream is over by the time it returns, so publish nothing
+                    # past its boundary (on_output could hold a new CR).
+                    if done.is_set():
+                        return
                     on_output(pdata.get('output') or '')
                     offset = pdata.get('offset', offset)
                     if pdata.get('state') == 'done':
@@ -381,11 +390,14 @@ class WebTermClient:
                 self.post('kill', job=job)
             except Exception:
                 pass
-            done.set()
-            self.current_job = None
             raise
-        t.join(timeout=5)
-        self.current_job = None
+        finally:
+            # Stop and join the poller on every exit path before exec_stream's
+            # finally clears any held CR: an in-flight poll must not reach
+            # on_output (and hold a new CR) after the stream boundary.
+            done.set()
+            t.join(timeout=5)
+            self.current_job = None
         if 'auth_error' in result:
             raise result['auth_error']
         if 'error' in result:
