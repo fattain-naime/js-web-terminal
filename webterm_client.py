@@ -271,12 +271,22 @@ class WebTermClient:
         turns it on: `-c` has to return the moment the job reports done, not
         sit in input() until someone types a line nobody is there to type. The
         REPL in turn only forwards when stdin is a TTY, since a pipe or
-        /dev/null has no prompt to type at. Two wrinkles, both visible rather
-        than silent: a typed line is echoed to the remote job instead of the
-        local shell, and once the remote job finishes while this thread is
-        blocked waiting for a line, it only notices after the next Enter press
-        - a plain stdlib limitation with no portable fix.
+        /dev/null has no prompt to type at. On POSIX stdin is polled with a short
+        select() timeout, so the prompt returns as soon as the job finishes and
+        each line is acknowledged (or reported as undelivered) on stderr. On
+        Windows a console can't be select()ed, so it falls back to a blocking
+        input() prompt and only notices the job finished after one more Enter.
         """
+        try:
+            return self._exec_stream(command, on_output, pty, forward_stdin)
+        finally:
+            # A CR held back for a chunk boundary that never came must not leak
+            # into whatever is printed next (the prompt, the next command).
+            end_stream = getattr(on_output, 'end_stream', None)
+            if end_stream:
+                end_stream()
+
+    def _exec_stream(self, command, on_output, pty, forward_stdin):
         exec_fields = {'pty': True} if pty else {}
         data = self.post('exec', command=command, **exec_fields)
         on_output(data.get('output') or '')
@@ -352,11 +362,7 @@ class WebTermClient:
                         done.wait()
                         break
                     if not done.is_set():
-                        try:
-                            self.input(job, line.rstrip('\r\n') + '\n')
-                            eprint('[-> job {}]'.format(job[:8]))
-                        except Exception:
-                            pass
+                        self._send_line(job, line.rstrip('\r\n') + '\n', ack=True)
             elif can_input:
                 # Windows can't select() on a console, so fall back to a
                 # blocking read - with its prompt and the extra-Enter wrinkle.
@@ -366,10 +372,7 @@ class WebTermClient:
                     except EOFError:
                         break
                     if not done.is_set():
-                        try:
-                            self.input(job, line + '\n')
-                        except Exception:
-                            pass
+                        self._send_line(job, line + '\n', ack=False)
             else:
                 done.wait()
         except KeyboardInterrupt:
@@ -391,6 +394,26 @@ class WebTermClient:
 
     def input(self, job_id, text):
         return self.post('input', job=job_id, data=text)
+
+    def _send_line(self, job, text, ack):
+        """Send a typed line to the job and say what the server actually answered.
+
+        The acknowledgement is the only signal that the line went to the remote
+        job rather than the local shell, so it must not claim delivery the
+        server denied: a finished job is an HTTP 200 with ok:false.
+        """
+        try:
+            reply = self.input(job, text)
+        except Exception as e:
+            eprint('[input to job {} failed: {}]'.format(job[:8], e))
+            return False
+        if reply.get('ok'):
+            if ack:
+                eprint('[-> job {}]'.format(job[:8]))
+            return True
+        eprint('[line not delivered: {}]'.format(
+            (reply.get('output') or 'the server refused it').strip()))
+        return False
 
     def kill(self, job_id):
         return self.post('kill', job=job_id)
@@ -594,6 +617,17 @@ def print_chunk(text):
         _pending_cr = True
     sys.stdout.write(text.replace('\r\n', '\n'))
     sys.stdout.flush()
+
+
+def _end_stream():
+    # Drop, don't flush, a CR still held when a stream ends: flushing would put
+    # a stray CR back into redirected output, and dropping costs nothing but a
+    # cursor that stays mid-line.
+    global _pending_cr
+    _pending_cr = False
+
+
+print_chunk.end_stream = _end_stream
 
 
 def describe_unreadable(data, fallback_path):
