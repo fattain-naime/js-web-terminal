@@ -351,14 +351,14 @@ browser, and `Ctrl+C` sends a kill signal to whatever is currently
 running. `cd` and exported environment variables both persist for the
 life of the API key or session, including between separate one-shot
 invocations of the CLI when using an API key. If the command you ran is
-waiting on input (e.g. it calls `read`), the prompt changes to
-`stdin -> job <id>:` and a line you type there goes straight to the job
-rather than to a shell. That prompt only appears in the interactive shell,
-and only when your own stdin is a terminal: a one-shot `-c` never reads
-stdin, so it returns the moment the job finishes instead of waiting for a
-line nobody is there to type. One stdlib wrinkle worth knowing: if the job
-finishes while the CLI is sitting there waiting for your next line, it only
-notices after you press Enter once more.
+waiting on input (e.g. it calls `read`), just type a line while it runs:
+it goes straight to the job rather than to a shell, and is acknowledged
+with `[-> job <id>]`. That only happens in the interactive shell, and only
+when your own stdin is a terminal: a one-shot `-c` never reads stdin, so
+it returns the moment the job finishes instead of waiting for a line
+nobody is there to type. On Windows the CLI can't poll the console, so it
+falls back to a blocking `stdin -> job <id>:` prompt and only notices the
+job has finished after you press Enter once more.
 
 Run `python3 webterm_client.py --help` for all flags.
 
@@ -427,14 +427,13 @@ call is still in effect on the next).
   full-screen program that redraws in place (`vim`, `top`, a pager
   without `-F`/`| cat`) will not render correctly; use non-interactive
   equivalents for those regardless of PTY mode.
-- Feeding input to a running job (the browser's input box, or the CLI
-  shell's `stdin -> job <id>:` prompt) requires `mkfifo` on the server
-  host; where it's unavailable the job simply has no input box/prompt and
-  runs as before. The CLI's own stdin-forwarding has two wrinkles: it
-  needs a real terminal on your side (a piped or redirected one-shot `-c`
-  never reads stdin, so it can't be made to wait for input), and if the
-  remote job finishes while the CLI is blocked waiting for your next line,
-  it only notices after you press Enter once more.
+- Feeding input to a running job (the browser's input box, or typing in
+  the CLI shell while a command runs) requires `mkfifo` on the server
+  host; where it's unavailable the job simply has no input box and runs as
+  before. The CLI needs a real terminal on your side for this (a piped or
+  redirected one-shot `-c` never reads stdin, so it can't be made to wait
+  for input), and on Windows it falls back to a blocking prompt that
+  needs one extra Enter once the job has finished.
 - Persisted environment variables (`export FOO=bar` carrying over to the
   next command, same as `cd`) need a POSIX shell (`sh`/`bash`/`dash`) on
   the server host to dump and restore them; where none is usable, `export`

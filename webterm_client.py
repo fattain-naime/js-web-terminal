@@ -36,8 +36,9 @@ Long-running remote commands are handled automatically: the server turns them
 into a background job and this client streams the output as it polls, exactly
 like the browser UI does. Press Ctrl+C to send a kill signal to the job that
 is currently running. If a job is reading input (e.g. a `read` prompt), just
-type at the `stdin -> job ...` prompt and press Enter to send it through - the
-REPL does that from a terminal only, so a one-shot -c never blocks on stdin.
+type a line while it runs and press Enter - it is sent to the job and
+acknowledged with `[-> job ...]`. The REPL does that from a terminal only, so
+a one-shot -c never blocks on stdin.
 
 Persisted state across commands: current directory and exported environment
 variables both carry over between commands in the same session, just like a
@@ -53,6 +54,7 @@ import getpass
 import json
 import os
 import re
+import select
 import signal
 import ssl
 import subprocess
@@ -335,11 +337,31 @@ class WebTermClient:
         t = threading.Thread(target=poll_loop, daemon=True)
         t.start()
         try:
-            if can_input:
+            if can_input and os.name != 'nt':
+                # Wait on stdin with a short timeout instead of blocking in
+                # input(): the loop re-checks `done` every tick, so the prompt
+                # comes back the moment the job finishes - no extra Enter. A
+                # sent line is acknowledged on stderr so it visibly went to the
+                # job and not to the local shell.
+                while not done.is_set():
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                    if not ready:
+                        continue
+                    line = sys.stdin.readline()
+                    if line == '':  # EOF on stdin: stop forwarding, keep waiting
+                        done.wait()
+                        break
+                    if not done.is_set():
+                        try:
+                            self.input(job, line.rstrip('\r\n') + '\n')
+                            eprint('[-> job {}]'.format(job[:8]))
+                        except Exception:
+                            pass
+            elif can_input:
+                # Windows can't select() on a console, so fall back to a
+                # blocking read - with its prompt and the extra-Enter wrinkle.
                 while not done.is_set():
                     try:
-                        # The prompt is what makes the forwarding legible: what
-                        # you type here goes to the remote job, not to a shell.
                         line = input('stdin -> job {}: '.format(job[:8]))
                     except EOFError:
                         break
@@ -546,21 +568,32 @@ REPL_HELP = """
 
 Paths containing spaces can be quoted: !download "my file.txt" ./out.txt
 Everything else is sent to the server as a real shell command. If the job
-accepts input (e.g. it calls `read`), type it at the `stdin -> job ...`
-prompt that appears instead of the command prompt; one-shot -c never reads
+accepts input (e.g. it calls `read`), just type a line while it runs; it is
+sent to the job and acknowledged with `[-> job ...]`. One-shot -c never reads
 stdin.
 """
 
 
+_pending_cr = False
+
+
 def print_chunk(text):
-    # CR is stripped, not just before a newline: a PTY job's line discipline
-    # turns every \n into \r\n (onlcr), and a stray CR left in the output
-    # breaks grep/diff and ends up in redirected files. The browser drops it
-    # too, and a real TTY expands a bare \n back to \r\n on the way out, so
-    # both clients and both paths stay interchangeable for scripting.
-    if text:
-        sys.stdout.write(text.replace('\r', ''))
-        sys.stdout.flush()
+    # A PTY job's line discipline turns every \n into \r\n (onlcr), and a stray
+    # CR left in redirected output breaks grep/diff. So \r\n is collapsed to \n
+    # - a real TTY expands it back on the way out - but a bare \r is kept, since
+    # that is how progress bars (git clone, pip) redraw in place. A chunk can end
+    # between the \r and its \n, so a trailing \r is held until the next chunk.
+    global _pending_cr
+    if not text:
+        return
+    if _pending_cr:
+        text = '\r' + text
+        _pending_cr = False
+    if text.endswith('\r'):
+        text = text[:-1]
+        _pending_cr = True
+    sys.stdout.write(text.replace('\r\n', '\n'))
+    sys.stdout.flush()
 
 
 def describe_unreadable(data, fallback_path):
