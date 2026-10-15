@@ -36,7 +36,8 @@ Long-running remote commands are handled automatically: the server turns them
 into a background job and this client streams the output as it polls, exactly
 like the browser UI does. Press Ctrl+C to send a kill signal to the job that
 is currently running. If a job is reading input (e.g. a `read` prompt), just
-type and press Enter to send it through.
+type at the `stdin -> job ...` prompt and press Enter to send it through - the
+REPL does that from a terminal only, so a one-shot -c never blocks on stdin.
 
 Persisted state across commands: current directory and exported environment
 variables both carry over between commands in the same session, just like a
@@ -258,17 +259,21 @@ class WebTermClient:
 
     # ---- exec / poll / kill ----
 
-    def exec_stream(self, command, on_output, pty=False):
+    def exec_stream(self, command, on_output, pty=False, forward_stdin=False):
         """Run a command, streaming output to on_output(text). Returns exit code (int or None).
 
-        If the job accepts input (see the `input` action / web_terminal.php's
-        wt_job_start FIFO), this also reads lines from stdin and forwards them
-        to the job while it runs - polling happens on a background thread so
-        typing doesn't have to wait for the next poll tick. The one wrinkle:
-        once the remote job finishes while this thread is blocked waiting for
-        a line, it only notices after the next Enter press - a plain stdlib
-        limitation with no portable fix, so it's worth knowing about rather
-        than surprising.
+        With forward_stdin, a job the server says can take input (the `input`
+        action / web_terminal.php's wt_job_start FIFO) is also fed lines typed
+        here, read on this thread so typing doesn't have to wait for the next
+        poll tick. It is off by default, and the REPL is the only caller that
+        turns it on: `-c` has to return the moment the job reports done, not
+        sit in input() until someone types a line nobody is there to type. The
+        REPL in turn only forwards when stdin is a TTY, since a pipe or
+        /dev/null has no prompt to type at. Two wrinkles, both visible rather
+        than silent: a typed line is echoed to the remote job instead of the
+        local shell, and once the remote job finishes while this thread is
+        blocked waiting for a line, it only notices after the next Enter press
+        - a plain stdlib limitation with no portable fix.
         """
         exec_fields = {'pty': True} if pty else {}
         data = self.post('exec', command=command, **exec_fields)
@@ -280,7 +285,11 @@ class WebTermClient:
 
         job = data['job']
         self.current_job = job
-        can_input = bool(data.get('canInput'))
+        # canInput is a host capability ("mkfifo exists here"), not a statement
+        # that this job is reading, so it is true for every background command.
+        # forward_stdin is the caller's intent and isatty() is what makes a
+        # typed line visible - together they keep -c from blocking on stdin.
+        can_input = forward_stdin and bool(data.get('canInput')) and sys.stdin.isatty()
         offset = data.get('offset', 0)
         done = threading.Event()
         result = {}
@@ -329,7 +338,9 @@ class WebTermClient:
             if can_input:
                 while not done.is_set():
                     try:
-                        line = input()
+                        # The prompt is what makes the forwarding legible: what
+                        # you type here goes to the remote job, not to a shell.
+                        line = input('stdin -> job {}: '.format(job[:8]))
                     except EOFError:
                         break
                     if not done.is_set():
@@ -535,14 +546,29 @@ REPL_HELP = """
 
 Paths containing spaces can be quoted: !download "my file.txt" ./out.txt
 Everything else is sent to the server as a real shell command. If the job
-accepts input (e.g. it calls `read`), just type it and press Enter.
+accepts input (e.g. it calls `read`), type it at the `stdin -> job ...`
+prompt that appears instead of the command prompt; one-shot -c never reads
+stdin.
 """
 
 
 def print_chunk(text):
+    # CR is stripped, not just before a newline: a PTY job's line discipline
+    # turns every \n into \r\n (onlcr), and a stray CR left in the output
+    # breaks grep/diff and ends up in redirected files. The browser drops it
+    # too, and a real TTY expands a bare \n back to \r\n on the way out, so
+    # both clients and both paths stay interchangeable for scripting.
     if text:
-        sys.stdout.write(text)
+        sys.stdout.write(text.replace('\r', ''))
         sys.stdout.flush()
+
+
+def describe_unreadable(data, fallback_path):
+    """Why fs_read returned no content: binary bytes, or another encoding."""
+    path = data.get('path', fallback_path)
+    if data.get('encoding') == 'non-utf8':
+        return '{} is not valid UTF-8 text'.format(path)
+    return '{} is a binary file'.format(path)
 
 
 def run_one_shot(client, command, pty=False):
@@ -564,8 +590,8 @@ def edit_remote_file(client, path):
         eprint((data.get('output') or 'Could not read file.').rstrip())
         return
     if data.get('binary'):
-        eprint('{} is a binary file ({} bytes) - edit not supported here.'.format(
-            data.get('path', path), data.get('size', '?')))
+        eprint('{} ({} bytes) - edit not supported here.'.format(
+            describe_unreadable(data, path), data.get('size', '?')))
         return
     original = data.get('content') or ''
     editor = os.environ.get('EDITOR') or ('notepad' if os.name == 'nt' else 'vi')
@@ -716,8 +742,8 @@ def repl(client, pty=False):
             if not data.get('ok', True):
                 eprint((data.get('output') or 'Could not read file.').rstrip())
             elif data.get('binary'):
-                eprint('{} is a binary file ({} bytes) - use !download instead.'.format(
-                    data.get('path', parts[0]), data.get('size', '?')))
+                eprint('{} ({} bytes) - use !download instead.'.format(
+                    describe_unreadable(data, parts[0]), data.get('size', '?')))
             else:
                 sys.stdout.write(data.get('content') or '')
                 if not (data.get('content') or '').endswith('\n'):
@@ -787,7 +813,7 @@ def repl(client, pty=False):
             continue
 
         try:
-            code = client.exec_stream(cmd, print_chunk, pty=pty_mode)
+            code = client.exec_stream(cmd, print_chunk, pty=pty_mode, forward_stdin=True)
         except KeyboardInterrupt:
             continue
         except AuthError as e:
