@@ -865,7 +865,8 @@ function wt_job_start($command, $cwd, $identityId, $pty = false)
 /**
  * Write text to a running job's stdin FIFO, if it has one. Returns true on
  * success, false if the job has no FIFO (mkfifo unavailable on this host,
- * or the job already finished and its FIFO was cleaned up).
+ * or the job already finished and its FIFO was cleaned up) or the write
+ * could not be completed.
  */
 function wt_job_send_input($id, $text)
 {
@@ -879,21 +880,24 @@ function wt_job_send_input($id, $text)
     if (!file_exists($p['fifo'])) {
         return false;
     }
-    // Open read-write, not write-only: opening a FIFO for writing blocks
-    // until a reader shows up, and the only reader is the job process itself
-    // - which can exit between the caller's liveness check and this open. An
-    // O_RDWR open never blocks (the same trick as the "<>" redirect above), so
-    // that race costs a write nobody reads rather than wedging the request for
-    // max_execution_time. It also fails outright once the FIFO is gone, where
-    // "w" would silently re-create the path as a plain file and report success.
+    // Opened read-write, never write-only: opening a FIFO for writing blocks
+    // until a reader shows up, and the only reader is the job - which may have
+    // exited between the caller's wt_job_running() check and this line, in
+    // which case the request would hang here until max_execution_time (forever
+    // where that is 0). O_RDWR never blocks, and this handle is then a reader
+    // itself; that is the same property the "<>" redirect in wt_job_start
+    // relies on. Writes are non-blocking for the same reason: if the job is
+    // gone the bytes just sit in the pipe buffer until fclose() drops them.
     $h = @fopen($p['fifo'], 'r+');
     if (!$h) {
         return false;
     }
     stream_set_blocking($h, false);
-    $ok = @fwrite($h, $text);
+    $wrote = @fwrite($h, $text);
     fclose($h);
-    return $ok !== false;
+    // A short write means the buffer was full with nothing draining it, so
+    // report it rather than pretend the whole line was delivered.
+    return $wrote === strlen($text);
 }
 
 function wt_job_running($id)
@@ -1435,20 +1439,23 @@ if ($wtIsPost) {
         if ($content === false) {
             wt_json(['ok' => false, 'output' => "Could not read {$src}\n"]);
         }
-        // Refuse anything the editor cannot round-trip byte-for-byte. A null
-        // byte is the cheap "this is binary" signal, but it is not the only
-        // one that matters here: wt_json() encodes with
-        // JSON_INVALID_UTF8_SUBSTITUTE, so any byte sequence that is not
-        // valid UTF-8 (latin-1, cp1252, ...) would come back as U+FFFD and
-        // be written straight back over the file on save - silent
-        // corruption. Download is byte-exact, so send those there instead.
-        $binary = strpos($content, "\0") !== false || preg_match('//u', $content) !== 1;
+        // The editor round-trips content through JSON, and wt_json() encodes
+        // with JSON_INVALID_UTF8_SUBSTITUTE - so a file that is not valid
+        // UTF-8 comes back full of U+FFFD and saving it rewrites the file.
+        // A null byte is the cheap "this is binary" signal; a failed /u match
+        // catches every other encoding (latin-1, cp1252, ...). Neither is
+        // offered to the editor; both say to use download instead, which is
+        // byte-exact, and 'encoding' says which one it was so the UI and the
+        // CLI can explain it.
+        $binary = strpos($content, "\0") !== false;
+        $utf8   = !$binary && @preg_match('//u', $content) === 1;
         wt_json([
-            'ok' => true,
-            'path' => $src,
-            'binary' => $binary,
-            'content' => $binary ? '' : $content,
-            'size' => $size,
+            'ok'       => true,
+            'path'     => $src,
+            'binary'   => !$utf8,
+            'encoding' => $utf8 ? 'utf-8' : ($binary ? 'binary' : 'non-utf8'),
+            'content'  => $utf8 ? $content : '',
+            'size'     => $size,
         ]);
     }
 
@@ -2636,8 +2643,11 @@ $wtBoot = [
         const d = await api({ action: 'fs_read', path: path });
         if (!d.ok) { alert(d.output || 'Could not open that file.'); return; }
         if (d.binary) {
+            const why = d.encoding === 'non-utf8'
+                ? 'This file is not valid UTF-8 text, so the editor would rewrite its bytes - use download instead.'
+                : 'This looks like a binary file - use download instead of the text editor.';
             panelsEl.innerHTML = '<div class="panel files-editor"><h4>' + escapeHtml(path) + '</h4>' +
-                '<div class="sys" style="color:var(--dim)">This is binary, or not valid UTF-8 text - use download instead of the text editor.</div>' +
+                '<div class="sys" style="color:var(--dim)">' + why + '</div>' +
                 '<div class="files-editor-actions"><button class="icon-btn" data-back type="button">Back</button>' +
                 '<button class="icon-btn" data-dl type="button">Download</button></div></div>';
         } else {

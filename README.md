@@ -96,9 +96,9 @@ webterm_client.py  the CLI client, in one file
   files and directories from the browser's Files panel, or with the CLI's
   `!ls`, `!cat`, `!edit`, `!mkdir`, `!mv` and `!rm`. Uses the same
   directory-scoping rules as upload/download, and the in-browser/CLI
-  editor refuses anything that isn't valid UTF-8 text (so a legacy-encoded
-  or binary file is never silently rewritten) or is over the configured size
-  cap - download those and edit them locally instead.
+  editor opens only valid UTF-8 text up to the configured size cap: a
+  binary file, or one in another encoding (latin-1, cp1252, ...), is
+  refused rather than silently rewritten — use download for those.
 - **File transfer** - drag a file onto the browser terminal (or click
   Upload) to send it to the current directory; type `download <path>` in
   the browser, or use `webterm_client.py URL --upload/--download` or the
@@ -351,10 +351,14 @@ browser, and `Ctrl+C` sends a kill signal to whatever is currently
 running. `cd` and exported environment variables both persist for the
 life of the API key or session, including between separate one-shot
 invocations of the CLI when using an API key. If the command you ran is
-waiting on input (e.g. it calls `read`), just type a line and press
-Enter - it's sent straight to the job. One stdlib wrinkle worth knowing:
-if the job finishes while the CLI is sitting there waiting for your next
-line, it only notices after you press Enter once more.
+waiting on input (e.g. it calls `read`), the prompt changes to
+`stdin -> job <id>:` and a line you type there goes straight to the job
+rather than to a shell. That prompt only appears in the interactive shell,
+and only when your own stdin is a terminal: a one-shot `-c` never reads
+stdin, so it returns the moment the job finishes instead of waiting for a
+line nobody is there to type. One stdlib wrinkle worth knowing: if the job
+finishes while the CLI is sitting there waiting for your next line, it only
+notices after you press Enter once more.
 
 Run `python3 webterm_client.py --help` for all flags.
 
@@ -423,15 +427,14 @@ call is still in effect on the next).
   full-screen program that redraws in place (`vim`, `top`, a pager
   without `-F`/`| cat`) will not render correctly; use non-interactive
   equivalents for those regardless of PTY mode.
-- Feeding input to a running job (the browser's input box, or the CLI's
-  `stdin → job` prompt) requires `mkfifo` on the server host; where it's
-  unavailable the job simply has no input box/prompt and runs as before.
-  Only an interactive CLI forwards stdin: `-c` runs the command and exits
-  with its code, and a piped or scripted REPL doesn't forward either, so
-  nothing ever waits on a stdin that isn't yours to type into. When the CLI
-  *is* forwarding, there's one stdlib wrinkle: if the remote job finishes
-  while it's blocked waiting for your next line, it only notices after you
-  press Enter once more.
+- Feeding input to a running job (the browser's input box, or the CLI
+  shell's `stdin -> job <id>:` prompt) requires `mkfifo` on the server
+  host; where it's unavailable the job simply has no input box/prompt and
+  runs as before. The CLI's own stdin-forwarding has two wrinkles: it
+  needs a real terminal on your side (a piped or redirected one-shot `-c`
+  never reads stdin, so it can't be made to wait for input), and if the
+  remote job finishes while the CLI is blocked waiting for your next line,
+  it only notices after you press Enter once more.
 - Persisted environment variables (`export FOO=bar` carrying over to the
   next command, same as `cd`) need a POSIX shell (`sh`/`bash`/`dash`) on
   the server host to dump and restore them; where none is usable, `export`
@@ -468,12 +471,14 @@ authenticated user or API key supplies. Keep in mind:
 - **Protect `.webterm_data/`** (see step 6 of Installation above) - it
   holds job output, command history and the audit log, which can contain
   sensitive data from whatever you've run.
-- **Persisted environment variables live in `.webterm_data/` too** - one
-  `env_<identity>.sh` per identity (the API key shares a single one,
-  `env_apikey.sh`), written by each command and *sourced* by the next one.
-  Anything you `export` there, secrets included, is therefore in clear text on
-  disk and stays there after you log out. `!reset-env` (or the `reset_env`
-  action) is how you clear it; deleting `.webterm_data/` clears all of it.
+- **Persisted environment variables land in that same directory** - every
+  command's `export -p` dump is written to `.webterm_data/env_<identity>.sh`
+  (`env_apikey.sh` for the API key, one file per browser session) and the
+  next command from that identity sources it, so anything you export —
+  a token, a password — is on disk in plain text. Run `!reset-env` (or
+  the `reset_env` action) when you're done with a value; nothing reaps
+  those files automatically, so delete them yourself if you stop using
+  the identity.
 - **Review the audit log** occasionally (inside `.webterm_data/`).
 - **Delete the file (and `.webterm_data/`) when you are done** if you
   don't need it permanently.
