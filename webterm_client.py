@@ -25,14 +25,27 @@ Quick start
 
 Interactive session built-ins (not sent to the remote shell):
   !upload <local> <remote>   !download <remote> <local>
-  !jobs                      !kill <job-id>
-  !history                   !clear
+  !ls [path]                 !cat <path>
+  !edit <path>                !rm <path>            !mkdir <path>
+  !mv <src> <dst>             !env                   !reset-env
+  !pty                        !jobs                   !kill <job-id>
+  !history                    !clear
   !help                      exit / logout
 
 Long-running remote commands are handled automatically: the server turns them
 into a background job and this client streams the output as it polls, exactly
 like the browser UI does. Press Ctrl+C to send a kill signal to the job that
-is currently running.
+is currently running. If a job is reading input (e.g. a `read` prompt), just
+type a line while it runs and press Enter - it is sent to the job and
+acknowledged with `[-> job ...]`. The REPL does that from a terminal only, so
+a one-shot -c never blocks on stdin.
+
+Persisted state across commands: current directory and exported environment
+variables both carry over between commands in the same session, just like a
+real shell (see !env / !reset-env). Pass --pty, or toggle !pty in the REPL,
+to allocate a real pseudo-terminal for commands that need one (isatty checks,
+some interactive CLIs) - full-screen apps like vim or top will only show
+their scrollback, not redraw in place.
 """
 
 import argparse
@@ -41,9 +54,13 @@ import getpass
 import json
 import os
 import re
+import select
 import signal
 import ssl
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -244,24 +261,67 @@ class WebTermClient:
 
     # ---- exec / poll / kill ----
 
-    def exec_stream(self, command, on_output):
-        """Run a command, streaming output to on_output(text). Returns exit code (int or None)."""
-        data = self.post('exec', command=command)
+    def exec_stream(self, command, on_output, pty=False, forward_stdin=False):
+        """Run a command, streaming output to on_output(text). Returns exit code (int or None).
+
+        With forward_stdin, a job the server says can take input (the `input`
+        action / web_terminal.php's wt_job_start FIFO) is also fed lines typed
+        here, read on this thread so typing doesn't have to wait for the next
+        poll tick. It is off by default, and the REPL is the only caller that
+        turns it on: `-c` has to return the moment the job reports done, not
+        sit in input() until someone types a line nobody is there to type. The
+        REPL in turn only forwards when stdin is a TTY, since a pipe or
+        /dev/null has no prompt to type at. On POSIX stdin is polled with a short
+        select() timeout, so the prompt returns as soon as the job finishes and
+        each line is acknowledged (or reported as undelivered) on stderr. On
+        Windows a console can't be select()ed, so it falls back to a blocking
+        input() prompt and only notices the job finished after one more Enter.
+        """
+        try:
+            return self._exec_stream(command, on_output, pty, forward_stdin)
+        finally:
+            # A CR held back for a chunk boundary that never came must not leak
+            # into whatever is printed next (the prompt, the next command).
+            end_stream = getattr(on_output, 'end_stream', None)
+            if end_stream:
+                end_stream()
+
+    def _exec_stream(self, command, on_output, pty, forward_stdin):
+        exec_fields = {'pty': True} if pty else {}
+        data = self.post('exec', command=command, **exec_fields)
         on_output(data.get('output') or '')
         if data.get('cwd'):
             self.cwd = data['cwd']
-        if data.get('state') == 'running' and data.get('job'):
-            self.current_job = data['job']
-            offset = data.get('offset', 0)
+        if data.get('state') != 'running' or not data.get('job'):
+            return data.get('exitCode')
+
+        job = data['job']
+        self.current_job = job
+        # canInput is a host capability ("mkfifo exists here"), not a statement
+        # that this job is reading, so it is true for every background command.
+        # forward_stdin is the caller's intent and isatty() is what makes a
+        # typed line visible - together they keep -c from blocking on stdin.
+        can_input = forward_stdin and bool(data.get('canInput')) and sys.stdin.isatty()
+        offset = data.get('offset', 0)
+        done = threading.Event()
+        result = {}
+
+        def poll_loop():
+            nonlocal offset
             transient = 0
             try:
-                while True:
+                while not done.is_set():
                     time.sleep(POLL_INTERVAL)
+                    # A kill may have landed during the sleep - don't start a
+                    # poll the stream is no longer waiting for.
+                    if done.is_set():
+                        return
                     try:
-                        pdata = self.post('poll', timeout=POLL_TIMEOUT,
-                                          job=self.current_job, offset=offset)
-                    except AuthError:
-                        raise
+                        pdata = self.post('poll', timeout=POLL_TIMEOUT, job=job, offset=offset)
+                    except AuthError as e:
+                        result['auth_error'] = e
+                        done.set()
+                        return
                     except WebTermError as e:
                         # A transient 429/5xx must not orphan the job: the server is
                         # still running it and we are the only handle on it. Retry a
@@ -269,27 +329,103 @@ class WebTermClient:
                         # user can still kill it by hand.
                         transient += 1
                         if transient > POLL_MAX_RETRIES:
-                            eprint('\n[giving up polling job {}: {}]'.format(self.current_job, e))
-                            raise
+                            eprint('\n[giving up polling job {}: {}]'.format(job, e))
+                            result['error'] = e
+                            done.set()
+                            return
                         time.sleep(POLL_RETRY_DELAY)
                         continue
                     transient = 0
+                    # A kill can also land while this poll is in flight; the
+                    # stream is over by the time it returns, so publish nothing
+                    # past its boundary (on_output could hold a new CR).
+                    if done.is_set():
+                        return
                     on_output(pdata.get('output') or '')
                     offset = pdata.get('offset', offset)
                     if pdata.get('state') == 'done':
-                        self.current_job = None
                         if pdata.get('cwd'):
                             self.cwd = pdata['cwd']
-                        return pdata.get('exitCode')
-            except KeyboardInterrupt:
-                eprint('\n[sending kill signal...]')
-                try:
-                    self.post('kill', job=self.current_job)
-                except Exception:
-                    pass
-                self.current_job = None
-                raise
-        return data.get('exitCode')
+                        result['exitCode'] = pdata.get('exitCode')
+                        done.set()
+                        return
+            except Exception as e:  # keep the main thread from hanging forever
+                result['error'] = e
+                done.set()
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+        try:
+            if can_input and os.name != 'nt':
+                # Wait on stdin with a short timeout instead of blocking in
+                # input(): the loop re-checks `done` every tick, so the prompt
+                # comes back the moment the job finishes - no extra Enter. A
+                # sent line is acknowledged on stderr so it visibly went to the
+                # job and not to the local shell.
+                while not done.is_set():
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                    if not ready:
+                        continue
+                    line = sys.stdin.readline()
+                    if line == '':  # EOF on stdin: stop forwarding, keep waiting
+                        done.wait()
+                        break
+                    if not done.is_set():
+                        self._send_line(job, line.rstrip('\r\n') + '\n', ack=True)
+            elif can_input:
+                # Windows can't select() on a console, so fall back to a
+                # blocking read - with its prompt and the extra-Enter wrinkle.
+                while not done.is_set():
+                    try:
+                        line = input('stdin -> job {}: '.format(job[:8]))
+                    except EOFError:
+                        break
+                    if not done.is_set():
+                        self._send_line(job, line + '\n', ack=False)
+            else:
+                done.wait()
+        except KeyboardInterrupt:
+            eprint('\n[sending kill signal...]')
+            try:
+                self.post('kill', job=job)
+            except Exception:
+                pass
+            raise
+        finally:
+            # Stop and join the poller on every exit path before exec_stream's
+            # finally clears any held CR: an in-flight poll must not reach
+            # on_output (and hold a new CR) after the stream boundary.
+            done.set()
+            t.join(timeout=5)
+            self.current_job = None
+        if 'auth_error' in result:
+            raise result['auth_error']
+        if 'error' in result:
+            raise result['error']
+        return result.get('exitCode')
+
+    def input(self, job_id, text):
+        return self.post('input', job=job_id, data=text)
+
+    def _send_line(self, job, text, ack):
+        """Send a typed line to the job and say what the server actually answered.
+
+        The acknowledgement is the only signal that the line went to the remote
+        job rather than the local shell, so it must not claim delivery the
+        server denied: a finished job is an HTTP 200 with ok:false.
+        """
+        try:
+            reply = self.input(job, text)
+        except Exception as e:
+            eprint('[input to job {} failed: {}]'.format(job[:8], e))
+            return False
+        if reply.get('ok'):
+            if ack:
+                eprint('[-> job {}]'.format(job[:8]))
+            return True
+        eprint('[line not delivered: {}]'.format(
+            (reply.get('output') or 'the server refused it').strip()))
+        return False
 
     def kill(self, job_id):
         return self.post('kill', job=job_id)
@@ -299,6 +435,35 @@ class WebTermClient:
 
     def history(self):
         return self.post('history').get('history', [])
+
+    def env(self):
+        env = self.post('env').get('env', {})
+        # An empty PHP array round-trips through JSON as [] rather than {}, so
+        # an older server with nothing persisted yet can hand back a list here.
+        return env if isinstance(env, dict) else {}
+
+    def reset_env(self):
+        return self.post('reset_env')
+
+    # ---- file manager ----
+
+    def fs_list(self, path='.'):
+        return self.post('fs_list', path=path)
+
+    def fs_read(self, path):
+        return self.post('fs_read', path=path)
+
+    def fs_write(self, path, content):
+        return self.post('fs_write', path=path, content=content)
+
+    def fs_mkdir(self, path):
+        return self.post('fs_mkdir', path=path)
+
+    def fs_delete(self, path):
+        return self.post('fs_delete', path=path)
+
+    def fs_rename(self, path, new_path):
+        return self.post('fs_rename', path=path, newPath=new_path)
 
     # ---- files ----
 
@@ -420,6 +585,15 @@ def connect(args):
 REPL_HELP = """
   !upload <local> <remote>     upload a local file to the server
   !download <remote> <local>   download a remote file
+  !ls [path]                   list a remote directory (default: cwd)
+  !cat <path>                  print a remote text file
+  !edit <path>                 download, open in $EDITOR, upload if changed
+  !rm <path>                   delete a remote file or empty directory
+  !mkdir <path>                create a remote directory
+  !mv <src> <dst>              rename/move a remote file or directory
+  !env                         show persisted environment variables
+  !reset-env                   clear persisted environment variables
+  !pty                         toggle PTY mode for commands run from here on
   !jobs                        list background jobs
   !kill <job-id>                kill a background job
   !history                     show shared command history
@@ -428,22 +602,112 @@ REPL_HELP = """
   exit / logout / quit         log out and quit
 
 Paths containing spaces can be quoted: !download "my file.txt" ./out.txt
-Everything else is sent to the server as a real shell command.
+Everything else is sent to the server as a real shell command. If the job
+accepts input (e.g. it calls `read`), just type a line while it runs; it is
+sent to the job and acknowledged with `[-> job ...]`. One-shot -c never reads
+stdin.
 """
 
 
+_pending_cr = False
+
+
 def print_chunk(text):
-    if text:
-        sys.stdout.write(text)
-        sys.stdout.flush()
+    # A PTY job's line discipline turns every \n into \r\n (onlcr), and a stray
+    # CR left in redirected output breaks grep/diff. So \r\n is collapsed to \n
+    # - a real TTY expands it back on the way out - but a bare \r is kept, since
+    # that is how progress bars (git clone, pip) redraw in place. A chunk can end
+    # between the \r and its \n, so a trailing \r is held until the next chunk.
+    global _pending_cr
+    if not text:
+        return
+    if _pending_cr:
+        text = '\r' + text
+        _pending_cr = False
+    if text.endswith('\r'):
+        text = text[:-1]
+        _pending_cr = True
+    sys.stdout.write(text.replace('\r\n', '\n'))
+    sys.stdout.flush()
 
 
-def run_one_shot(client, command):
+def _end_stream():
+    # Drop, don't flush, a CR still held when a stream ends: flushing would put
+    # a stray CR back into redirected output, and dropping costs nothing but a
+    # cursor that stays mid-line.
+    global _pending_cr
+    _pending_cr = False
+
+
+print_chunk.end_stream = _end_stream
+
+
+def describe_unreadable(data, fallback_path):
+    """Why fs_read returned no content: binary bytes, or another encoding."""
+    path = data.get('path', fallback_path)
+    if data.get('encoding') == 'non-utf8':
+        return '{} is not valid UTF-8 text'.format(path)
+    return '{} is a binary file'.format(path)
+
+
+def run_one_shot(client, command, pty=False):
     try:
-        code = client.exec_stream(command, print_chunk)
+        code = client.exec_stream(command, print_chunk, pty=pty)
     except KeyboardInterrupt:
         sys.exit(130)
     sys.exit(code if isinstance(code, int) else 0)
+
+
+def edit_remote_file(client, path):
+    """Download path, open it in $EDITOR, upload it back if changed."""
+    try:
+        data = client.fs_read(path)
+    except WebTermError as e:
+        eprint(str(e))
+        return
+    if not data.get('ok', True):
+        eprint((data.get('output') or 'Could not read file.').rstrip())
+        return
+    if data.get('binary'):
+        eprint('{} ({} bytes) - edit not supported here.'.format(
+            describe_unreadable(data, path), data.get('size', '?')))
+        return
+    original = data.get('content') or ''
+    editor = os.environ.get('EDITOR') or ('notepad' if os.name == 'nt' else 'vi')
+    suffix = os.path.splitext(path)[1] or '.txt'
+    # fs_read only hands back valid UTF-8 now, so pin the temp file's encoding
+    # rather than inheriting the locale's, the same way newline='' is already
+    # pinned: the round trip must not depend on the host this runs on.
+    fd, tmp_path = tempfile.mkstemp(prefix='webterm_edit_', suffix=suffix)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+            f.write(original)
+        try:
+            ret = subprocess.call([editor, tmp_path])
+        except OSError as e:
+            eprint('Could not launch editor "{}": {}'.format(editor, e))
+            return
+        if ret != 0:
+            eprint('Editor exited with status {}; uploading anyway if content changed.'.format(ret))
+        with open(tmp_path, 'r', encoding='utf-8', newline='') as f:
+            updated = f.read()
+        if updated == original:
+            print('No changes.')
+            return
+        try:
+            wdata = client.fs_write(path, updated)
+        except WebTermError as e:
+            eprint('Save failed: {}'.format(e))
+            return
+        if not wdata.get('ok', True):
+            eprint((wdata.get('output') or 'Save failed.').rstrip())
+        else:
+            print((wdata.get('output') or 'Saved.').rstrip())
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def split_args(text):
@@ -455,9 +719,10 @@ def split_args(text):
     return [quoted or bare for quoted, bare in re.findall(r'"([^"]*)"|(\S+)', text)]
 
 
-def repl(client):
+def repl(client, pty=False):
     eprint('Connected to {}'.format(client.url))
     eprint('Type a command, or !help for client-side commands. exit / logout to quit.\n')
+    pty_mode = bool(pty)
     while True:
         prompt = '{} $ '.format(client.cwd or '~')
         try:
@@ -531,9 +796,106 @@ def repl(client):
             except (WebTermError, OSError) as e:
                 eprint('Download failed: {}'.format(e))
             continue
+        if cmd == '!ls' or cmd.startswith('!ls '):
+            parts = split_args(cmd[len('!ls'):])
+            path = parts[0] if parts else '.'
+            try:
+                data = client.fs_list(path)
+            except WebTermError as e:
+                eprint(str(e))
+                continue
+            print(data.get('path', path))
+            for e in data.get('entries', []):
+                kind = e.get('type', 'file')
+                size = '' if e.get('size') is None else str(e.get('size'))
+                mark = '/' if kind == 'dir' else ('@' if kind == 'link' else '')
+                print('{:<9} {:>10}  {}{}'.format(kind, size, e.get('name', ''), mark))
+            continue
+        if cmd.startswith('!cat '):
+            parts = split_args(cmd[len('!cat '):])
+            if not parts:
+                eprint('Usage: !cat <path>')
+                continue
+            try:
+                data = client.fs_read(parts[0])
+            except WebTermError as e:
+                eprint(str(e))
+                continue
+            if not data.get('ok', True):
+                eprint((data.get('output') or 'Could not read file.').rstrip())
+            elif data.get('binary'):
+                eprint('{} ({} bytes) - use !download instead.'.format(
+                    describe_unreadable(data, parts[0]), data.get('size', '?')))
+            else:
+                sys.stdout.write(data.get('content') or '')
+                if not (data.get('content') or '').endswith('\n'):
+                    print()
+            continue
+        if cmd.startswith('!edit '):
+            parts = split_args(cmd[len('!edit '):])
+            if not parts:
+                eprint('Usage: !edit <path>')
+                continue
+            edit_remote_file(client, parts[0])
+            continue
+        if cmd.startswith('!rm '):
+            parts = split_args(cmd[len('!rm '):])
+            if not parts:
+                eprint('Usage: !rm <path>')
+                continue
+            try:
+                data = client.fs_delete(parts[0])
+                print((data.get('output') or 'Deleted.').rstrip())
+            except WebTermError as e:
+                eprint(str(e))
+            continue
+        if cmd.startswith('!mkdir '):
+            parts = split_args(cmd[len('!mkdir '):])
+            if not parts:
+                eprint('Usage: !mkdir <path>')
+                continue
+            try:
+                data = client.fs_mkdir(parts[0])
+                print((data.get('output') or 'Created.').rstrip())
+            except WebTermError as e:
+                eprint(str(e))
+            continue
+        if cmd.startswith('!mv '):
+            parts = split_args(cmd[len('!mv '):])
+            if len(parts) != 2:
+                eprint('Usage: !mv <src> <dst>')
+                continue
+            try:
+                data = client.fs_rename(parts[0], parts[1])
+                print((data.get('output') or 'Renamed.').rstrip())
+            except WebTermError as e:
+                eprint(str(e))
+            continue
+        if cmd == '!env':
+            try:
+                env = client.env()
+            except WebTermError as e:
+                eprint(str(e))
+                continue
+            if not env:
+                print('(no persisted environment variables)')
+            for k, v in sorted(env.items()):
+                print('{}={}'.format(k, v))
+            continue
+        if cmd == '!reset-env':
+            try:
+                client.reset_env()
+                print('Environment reset to defaults.')
+            except WebTermError as e:
+                eprint(str(e))
+            continue
+        if cmd == '!pty':
+            pty_mode = not pty_mode
+            print('PTY mode is now {}.'.format('on' if pty_mode else 'off'))
+            continue
 
         try:
-            code = client.exec_stream(cmd, print_chunk)
+            code = client.exec_stream(cmd, print_chunk, pty=pty_mode, forward_stdin=True)
         except KeyboardInterrupt:
             continue
         except AuthError as e:
@@ -559,6 +921,9 @@ def main():
     parser.add_argument('--save', action='store_true', help='Save URL + API key (never the password) to ~/.config/webterm/')
     parser.add_argument('--upload', nargs=2, metavar=('LOCAL', 'REMOTE'), help='Upload a file and exit')
     parser.add_argument('--download', nargs=2, metavar=('REMOTE', 'LOCAL'), help='Download a file and exit')
+    parser.add_argument('--pty', action='store_true',
+                         help='Allocate a real pseudo-terminal for the command (-c), '
+                              'or start the REPL with PTY mode already on')
     args = parser.parse_args()
 
     client = connect(args)
@@ -571,9 +936,9 @@ def main():
             n = client.download(args.download[0], args.download[1])
             print('Downloaded {} bytes -> {}'.format(n, args.download[1]))
         elif args.command:
-            run_one_shot(client, args.command)
+            run_one_shot(client, args.command, pty=args.pty)
         else:
-            repl(client)
+            repl(client, pty=args.pty)
     except AuthError as e:
         eprint(str(e))
         sys.exit(1)

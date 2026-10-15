@@ -78,11 +78,27 @@ webterm_client.py  the CLI client, in one file
   per identity: a browser login and an API key are separate identities, so
   a job started in the browser isn't visible to the CLI unless the CLI is
   also logged in with that same password/session.
-- **Real shell behaviour** - `cd` persists between commands (per login
-  identity - a browser session or an API key - whether you're in the
-  browser or the CLI), stderr is merged into the output, the real exit
-  code is reported even when the command itself calls `exit N`, and
-  commands never hang waiting for keyboard input.
+- **Real shell behaviour** - `cd` and exported environment variables
+  (`export FOO=bar`) both persist between commands (per login identity - a
+  browser session or an API key - whether you're in the browser or the
+  CLI), stderr is merged into the output, the real exit code is reported
+  even when the command itself calls `exit N`, and a command that reads
+  from stdin (e.g. a `read` prompt, or any interactive CLI) can be fed
+  input from a later request instead of hanging forever - type into the
+  browser's input box, or just type and press Enter in the CLI.
+- **Optional real PTY** - tick "PTY" in the browser, pass `pty: true` to
+  `exec`, or use `--pty` / the CLI's `!pty` toggle, to run a command with
+  an actual pseudo-terminal attached (`isatty()` returns true, some
+  interactive CLIs behave differently). Off by default so the common case
+  stays simple and fast; see [Known limitations](#-known-limitations) for
+  what a PTY here can't do.
+- **File manager** - browse, create, open, edit, save, rename and delete
+  files and directories from the browser's Files panel, or with the CLI's
+  `!ls`, `!cat`, `!edit`, `!mkdir`, `!mv` and `!rm`. Uses the same
+  directory-scoping rules as upload/download, and the in-browser/CLI
+  editor opens only valid UTF-8 text up to the configured size cap: a
+  binary file, or one in another encoding (latin-1, cp1252, ...), is
+  refused rather than silently rewritten — use download for those.
 - **File transfer** - drag a file onto the browser terminal (or click
   Upload) to send it to the current directory; type `download <path>` in
   the browser, or use `webterm_client.py URL --upload/--download` or the
@@ -224,9 +240,10 @@ list/kill) relies on POSIX shell features (`setsid`, `nohup`, process
 groups, traps) and does not run on Windows. On a Windows host, every
 command instead runs synchronously with a hard timeout
 (`TERMINAL_COMMAND_TIMEOUT`), the same way the original single-shot
-version of this script worked - no `cd` persistence, no background jobs.
-Everything else (login, API key, upload/download, audit log) still works.
-For the full feature set, use a Linux/Unix host.
+version of this script worked - no `cd`/environment persistence, no
+background jobs, no job input, no PTY. Everything else (login, API key,
+upload/download, the file manager, audit log) still works. For the full
+feature set, use a Linux/Unix host.
 
 ## 🎮 Usage
 
@@ -248,11 +265,18 @@ For the full feature set, use a Linux/Unix host.
 6. `Up`/`Down` for history, `Ctrl+L` to clear, `Ctrl+C` to kill the
    currently running job.
 7. Use the **Info** button for a system-info panel, **Jobs** to see/kill/
-   re-attach to background jobs, **Theme**/**A+**/**A-** for display
-   preferences.
-8. Type `help` inside the terminal for the full list of built-in client
-   commands (`clear`, `exit`, `theme`, `upload`, `download <path>`,
-   `jobs`, `cmds`).
+   re-attach to background jobs, **Files** for the file manager (browse,
+   create, open/edit/save, rename, delete), **Theme**/**A+**/**A-** for
+   display preferences.
+8. If a command you run is waiting on input (e.g. it calls `read`), an
+   input box appears in the run bar - type and press Enter/click to send
+   it straight to the job, no need to re-run the command.
+9. Tick the **PTY** checkbox (next to the command input, when the host
+   supports it) before pressing Enter to run that command with a real
+   pseudo-terminal attached.
+10. Type `help` inside the terminal for the full list of built-in client
+    commands (`clear`, `exit`, `theme`, `upload`, `download <path>`,
+    `jobs`, `cmds`).
 
 ### ⌨️ Keyboard
 
@@ -293,6 +317,9 @@ python3 webterm_client.py URL --download remote.log ./remote.log
 # Save the URL + API key (never the password) for next time:
 python3 webterm_client.py URL --api-key xxxx --save
 python3 webterm_client.py -c "pwd"   # reuses the saved profile
+
+# Run a one-shot command with a real pseudo-terminal attached:
+python3 webterm_client.py URL --pty -c "some-interactive-cli --version"
 ```
 
 Inside the interactive CLI shell, built-ins start with `!` so they're
@@ -301,6 +328,15 @@ never confused with a real shell command:
 ```
 !upload <local> <remote>     upload a local file to the server
 !download <remote> <local>   download a remote file
+!ls [path]                   list a remote directory (default: cwd)
+!cat <path>                  print a remote text file
+!edit <path>                 download, open in $EDITOR, upload if changed
+!rm <path>                   delete a remote file or empty directory
+!mkdir <path>                create a remote directory
+!mv <src> <dst>               rename/move a remote file or directory
+!env                          show persisted environment variables
+!reset-env                    clear persisted environment variables
+!pty                          toggle PTY mode for commands run from here on
 !jobs                        list background jobs
 !kill <job-id>                kill a background job
 !history                     show shared command history
@@ -312,8 +348,17 @@ exit / logout / quit         log out and quit
 Everything else is sent straight to the server and run as a real shell
 command. A slow command streams its output as it polls, exactly like the
 browser, and `Ctrl+C` sends a kill signal to whatever is currently
-running. `cd` persists for the life of the API key or session, including
-between separate one-shot invocations of the CLI when using an API key.
+running. `cd` and exported environment variables both persist for the
+life of the API key or session, including between separate one-shot
+invocations of the CLI when using an API key. If the command you ran is
+waiting on input (e.g. it calls `read`), just type a line while it runs:
+it goes straight to the job rather than to a shell, and is acknowledged
+with `[-> job <id>]`. That only happens in the interactive shell, and only
+when your own stdin is a terminal: a one-shot `-c` never reads stdin, so
+it returns the moment the job finishes instead of waiting for a line
+nobody is there to type. On Windows the CLI can't poll the console, so it
+falls back to a blocking `stdin -> job <id>:` prompt and only notices the
+job has finished after you press Enter once more.
 
 Run `python3 webterm_client.py --help` for all flags.
 
@@ -366,29 +411,48 @@ All options are constants near the top of `web_terminal.php`:
 | `TERMINAL_ENABLE_HISTORY` | Keep shared command history per identity | `true` |
 
 The terminal starts in the directory containing `web_terminal.php`; use
-`cd` as usual. Working directory and history are tracked **per identity**
-on the server: one browser session is one identity, and the API key is a
-second, shared identity (so all CLI invocations using the same key share
-one `cd` history - handy for scripting, since `cd /some/project` in one
-CLI call is still in effect on the next).
+`cd` as usual. Working directory, exported environment variables, and
+history are tracked **per identity** on the server: one browser session is
+one identity, and the API key is a second, shared identity (so all CLI
+invocations using the same key share one `cd`/environment/history - handy
+for scripting, since `cd /some/project` or `export FOO=bar` in one CLI
+call is still in effect on the next).
 
 ### 🚧 Known limitations
 
-- Environment variables set with `export` do **not** persist between
-  separate commands (only the working directory does) - each command
-  runs as a fresh background job. Chain with `&&`, or set the variable
-  inline (`FOO=bar command`), when you need both in one line.
-- There is no real PTY, so full-screen interactive programs (`vim`,
-  `top`, a pager without `-F`/`| cat`) won't behave as they would over
-  SSH. Use non-interactive equivalents.
+- The optional PTY (`pty: true` / the browser's PTY checkbox / the CLI's
+  `--pty`/`!pty`) gives you a real pseudo-terminal - `isatty()` returns
+  true and some interactive CLIs change behavior accordingly - but output
+  is still only ever shown as scrollback, polled and appended. A
+  full-screen program that redraws in place (`vim`, `top`, a pager
+  without `-F`/`| cat`) will not render correctly; use non-interactive
+  equivalents for those regardless of PTY mode.
+- Feeding input to a running job (the browser's input box, or typing in
+  the CLI shell while a command runs) requires `mkfifo` on the server
+  host; where it's unavailable the job simply has no input box and runs as
+  before. The CLI needs a real terminal on your side for this (a piped or
+  redirected one-shot `-c` never reads stdin, so it can't be made to wait
+  for input), and on Windows it falls back to a blocking prompt that
+  needs one extra Enter once the job has finished.
+- Persisted environment variables (`export FOO=bar` carrying over to the
+  next command, same as `cd`) need a POSIX shell (`sh`/`bash`/`dash`) on
+  the server host to dump and restore them; where none is usable, `export`
+  still works within a single command/pipeline but won't be visible to
+  later ones. Chain with `&&`, or set the variable inline (`FOO=bar
+  command`), as a portable fallback.
 - Killing a job sends a process-group signal (via `setsid`, when
   available) so it reaches the command and anything it has forked - but a
   process that re-forks after the signal, or deliberately daemonizes
   itself out of its process group, may still survive. `setsid` is present
   on essentially all Linux hosts; where it's missing, kill falls back to
-  signaling the job's direct process and children only.
-- No background jobs, `cd` persistence, or kill on Windows hosts (see
-  **Windows hosts** above).
+  signaling the job's direct process and children only. A PTY-wrapped job
+  is reaped the same way: closing the pty master sends the wrapped
+  process a hangup, which in practice reliably tears it down too, even
+  though the PTY wrapper technically starts its own session.
+- No background jobs, `cd`/environment persistence, input, PTY, or kill on
+  Windows hosts (see **Windows hosts** above). The file manager (list,
+  read, write, create, delete, rename) works everywhere PHP itself runs,
+  Windows included.
 
 ## 🔒 Security Considerations
 
@@ -406,6 +470,14 @@ authenticated user or API key supplies. Keep in mind:
 - **Protect `.webterm_data/`** (see step 6 of Installation above) - it
   holds job output, command history and the audit log, which can contain
   sensitive data from whatever you've run.
+- **Persisted environment variables land in that same directory** - every
+  command's `export -p` dump is written to `.webterm_data/env_<identity>.sh`
+  (`env_apikey.sh` for the API key, one file per browser session) and the
+  next command from that identity sources it, so anything you export —
+  a token, a password — is on disk in plain text. Run `!reset-env` (or
+  the `reset_env` action) when you're done with a value; nothing reaps
+  those files automatically, so delete them yourself if you stop using
+  the identity.
 - **Review the audit log** occasionally (inside `.webterm_data/`).
 - **Delete the file (and `.webterm_data/`) when you are done** if you
   don't need it permanently.

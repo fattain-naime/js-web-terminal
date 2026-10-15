@@ -59,6 +59,7 @@ const TERMINAL_COMMAND_TIMEOUT = 60;       // hard timeout on hosts without back
 const TERMINAL_MAX_OUTPUT      = 1048576;  // max output bytes returned per exec/poll chunk
 const TERMINAL_MAX_COMMAND_LEN = 16384;
 const TERMINAL_MAX_UPLOAD_BYTES = 26214400; // 25 MB soft cap (also bounded by php.ini post_max_size)
+const TERMINAL_MAX_EDIT_BYTES   = 2097152;  // 2 MB cap for the in-browser file editor (fs_read/fs_write)
 
 // Where job logs, per-identity working directory and history are kept.
 // Defaults next to this script; move it outside the web root if you can,
@@ -401,6 +402,60 @@ function wt_set_cwd($identityId, $cwd)
     @file_put_contents(wt_cwd_file($identityId), $cwd, LOCK_EX);
 }
 
+// ---- Per-identity exported environment variables ----
+// Each command runs as its own fresh `sh -c`, so a plain `export FOO=bar`
+// would otherwise vanish the moment the command exits - exactly like `cd`
+// would without wt_cwd_file. The EXIT trap in wt_job_start dumps the shell's
+// exported variables (`export -p`, POSIX-portable: both dash and bash accept
+// re-sourcing their own `export -p` output) to this file; the next command
+// sources it first, so `export FOO=bar` on one line and `echo $FOO` on the
+// next behave like a real persistent shell.
+
+function wt_env_file($identityId)
+{
+    return wt_data_dir() . '/env_' . preg_replace('/[^a-z0-9_]/i', '', $identityId) . '.sh';
+}
+
+function wt_env_get($identityId)
+{
+    $f = wt_env_file($identityId);
+    if (!is_file($f)) {
+        return [];
+    }
+    $vars = [];
+    foreach (preg_split('/\r?\n/', (string) @file_get_contents($f)) as $line) {
+        // Matches the POSIX `export -p` line shape: export NAME='value' (or
+        // NAME="value" / declare -x NAME="value" on some shells).
+        if (preg_match('/^(?:export|declare -x)\s+([A-Za-z_][A-Za-z0-9_]*)=(.*)$/', $line, $m)) {
+            $val = $m[2];
+            if (strlen($val) >= 2 && (($val[0] === "'" && substr($val, -1) === "'") || ($val[0] === '"' && substr($val, -1) === '"'))) {
+                $val = substr($val, 1, -1);
+            }
+            $vars[$m[1]] = $val;
+        }
+    }
+    return $vars;
+}
+
+function wt_env_clear($identityId)
+{
+    @unlink(wt_env_file($identityId));
+}
+
+/**
+ * Resolve a user-supplied path against an identity's cwd the same way
+ * upload/download already do: an absolute path (leading / or a Windows
+ * drive letter) is used as-is, anything else is relative to $cwd.
+ */
+function wt_resolve_path($path, $cwd)
+{
+    $path = (string) $path;
+    if ($path !== '' && ($path[0] === '/' || preg_match('#^[A-Za-z]:[\\\\/]#', $path))) {
+        return $path;
+    }
+    return rtrim($cwd, '/\\') . DIRECTORY_SEPARATOR . $path;
+}
+
 function wt_history_file($identityId)
 {
     return wt_data_dir() . '/history_' . preg_replace('/[^a-z0-9_]/i', '', $identityId) . '.log';
@@ -632,6 +687,7 @@ function wt_job_paths($id)
         'cwd'  => $base . '.cwd',
         'pid'  => $base . '.pid',
         'meta' => $base . '.meta',
+        'fifo' => $base . '.fifo',
     ];
 }
 
@@ -670,10 +726,62 @@ function wt_has_setsid()
 }
 
 /**
+ * Whether `mkfifo` is available. When it is, a job's stdin is a named pipe
+ * instead of /dev/null, so the new `input` action can feed text to a running
+ * job - interactive prompts, a REPL, `mysql`, a confirmation prompt, etc.
+ * Cached the same way as wt_has_setsid().
+ */
+function wt_has_mkfifo()
+{
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+    $flag = wt_data_dir() . '/.has_mkfifo';
+    if (is_file($flag)) {
+        $cached = (trim((string) @file_get_contents($flag)) === '1');
+        return $cached;
+    }
+    $out = wt_run('command -v mkfifo >/dev/null 2>&1 && echo yes || echo no', 5, 64);
+    $cached = (trim((string) $out) === 'yes');
+    @file_put_contents($flag, $cached ? '1' : '0', LOCK_EX);
+    return $cached;
+}
+
+/**
+ * Whether Python 3's `pty` module is available. When it is, a job runs
+ * inside a real pseudo-terminal (python3 -c "pty.spawn(...)") instead of a
+ * plain pipe, so programs that check isatty() (python/node REPLs, `less`,
+ * even `vim`/`top`) behave as if attached to a terminal instead of refusing
+ * or falling back to a dumb mode. This does NOT make the browser a real
+ * terminal emulator: output is still an append-only scrollback (see
+ * ansiToSegments in the page below), so a full-screen redrawing program
+ * will "work" in the sense that it runs and accepts input, but its repeated
+ * screen redraws will scroll by rather than update in place. It is most
+ * useful for line-oriented interactive programs. Cached like wt_has_setsid().
+ */
+function wt_has_pty_python()
+{
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+    $flag = wt_data_dir() . '/.has_pty_python';
+    if (is_file($flag)) {
+        $cached = (trim((string) @file_get_contents($flag)) === '1');
+        return $cached;
+    }
+    $out = wt_run('command -v python3 >/dev/null 2>&1 && python3 -c "import pty" >/dev/null 2>&1 && echo yes || echo no', 5, 64);
+    $cached = (trim((string) $out) === 'yes');
+    @file_put_contents($flag, $cached ? '1' : '0', LOCK_EX);
+    return $cached;
+}
+
+/**
  * Start $command in the background. Returns the job id, or null if it could
  * not be started (e.g. no executor available).
  */
-function wt_job_start($command, $cwd, $identityId)
+function wt_job_start($command, $cwd, $identityId, $pty = false)
 {
     $id = bin2hex(random_bytes(10));
     $p  = wt_job_paths($id);
@@ -686,12 +794,52 @@ function wt_job_start($command, $cwd, $identityId)
     // "running" forever. The trap always fires, with $? already set to
     // whatever code the command (or its own `exit`) produced, and it does
     // not touch directories, so a `cd` the command makes still persists.
-    $trapAction = '__wt_rc=$?; echo $__wt_rc > ' . escapeshellarg($p['exit']) . '; pwd > ' . escapeshellarg($p['cwd']);
-    $innerCmd   = 'trap ' . escapeshellarg($trapAction) . ' EXIT; ' . $command;
-    $grouped    = wt_has_setsid();
-    $runner   = $grouped ? 'setsid sh -c' : 'nohup sh -c';
-    $script   = 'cd ' . escapeshellarg($cwd) . ' 2>/dev/null; ' . $runner . ' ' . escapeshellarg($innerCmd)
-        . ' > ' . escapeshellarg($p['log']) . ' 2>&1 < /dev/null & echo $!';
+    // It also dumps the shell's exported variables (wt_env_file) so a later
+    // command from the same identity can pick up what this one exported -
+    // the same trick as cwd, applied to `export FOO=bar` surviving between
+    // otherwise-independent `sh -c` invocations.
+    $envFile    = wt_env_file($identityId);
+    $trapAction = '__wt_rc=$?; echo $__wt_rc > ' . escapeshellarg($p['exit']) . '; pwd > ' . escapeshellarg($p['cwd'])
+        . '; export -p > ' . escapeshellarg($envFile) . ' 2>/dev/null';
+    $restoreEnv = is_file($envFile) ? '. ' . escapeshellarg($envFile) . ' 2>/dev/null; ' : '';
+    $innerCmd   = 'trap ' . escapeshellarg($trapAction) . ' EXIT; ' . $restoreEnv . $command;
+
+    $grouped = wt_has_setsid();
+    $runner  = $grouped ? 'setsid' : 'nohup';
+
+    // A FIFO (instead of /dev/null) as stdin lets the `input` action feed
+    // text to this job later while it's running - a confirmation prompt, a
+    // REPL, `mysql`, `ftp`, an `ssh` passphrase, etc. Opened read-write
+    // ("<>") rather than read-only so the backgrounding shell never blocks
+    // waiting for a writer to show up - it IS a writer, of itself.
+    $useFifo       = wt_has_mkfifo();
+    $mkfifoCmd     = '';
+    $stdinRedirect = '< /dev/null';
+    if ($useFifo) {
+        $mkfifoCmd     = 'rm -f ' . escapeshellarg($p['fifo']) . '; mkfifo ' . escapeshellarg($p['fifo']) . ' 2>/dev/null; ';
+        $stdinRedirect = '<> ' . escapeshellarg($p['fifo']);
+    }
+
+    // Opt-in: wrap the job in a real pseudo-terminal via Python's pty module
+    // so isatty()-sensitive programs (a python/node REPL, `less`, `mysql`'s
+    // nicer prompt, even `vim`/`top`) behave as if attached to a terminal
+    // instead of refusing or degrading. This does NOT turn the browser into
+    // a terminal emulator - output is still an append-only scrollback - so
+    // a full-screen redrawing program will run and accept input, but its
+    // repeated screen redraws will scroll by rather than update in place.
+    // Best suited to line-oriented interactive programs. See wt_has_pty_python.
+    $usePty = $pty && wt_has_pty_python();
+    if ($usePty) {
+        $pyScript   = 'import pty,base64;pty.spawn(["sh","-c",base64.b64decode("'
+            . base64_encode($innerCmd) . '").decode()])';
+        $execTarget = 'python3 -c ' . escapeshellarg($pyScript);
+    } else {
+        $execTarget = 'sh -c ' . escapeshellarg($innerCmd);
+    }
+
+    $script = 'cd ' . escapeshellarg($cwd) . ' 2>/dev/null; ' . $mkfifoCmd
+        . $runner . ' ' . $execTarget . ' > ' . escapeshellarg($p['log']) . ' 2>&1 ' . $stdinRedirect
+        . ' & echo $!';
 
     $pidOut = wt_run($script, 10, 4096);
     if ($pidOut === null) {
@@ -707,9 +855,49 @@ function wt_job_start($command, $cwd, $identityId)
         'started'  => time(),
         'pid'      => $pid,
         'grouped'  => $grouped,
+        'fifo'     => $useFifo,
+        'pty'      => $usePty,
     ]), LOCK_EX);
 
     return $id;
+}
+
+/**
+ * Write text to a running job's stdin FIFO, if it has one. Returns true on
+ * success, false if the job has no FIFO (mkfifo unavailable on this host,
+ * or the job already finished and its FIFO was cleaned up) or the write
+ * could not be completed.
+ */
+function wt_job_send_input($id, $text)
+{
+    $meta = wt_job_meta_read($id);
+    if ($meta === null || empty($meta['fifo'])) {
+        return false;
+    }
+    $p = wt_job_paths($id);
+    // is_file() is specifically false for a FIFO (it only matches regular
+    // files) - file_exists() is the one that's true for any node type.
+    if (!file_exists($p['fifo'])) {
+        return false;
+    }
+    // Opened read-write, never write-only: opening a FIFO for writing blocks
+    // until a reader shows up, and the only reader is the job - which may have
+    // exited between the caller's wt_job_running() check and this line, in
+    // which case the request would hang here until max_execution_time (forever
+    // where that is 0). O_RDWR never blocks, and this handle is then a reader
+    // itself; that is the same property the "<>" redirect in wt_job_start
+    // relies on. Writes are non-blocking for the same reason: if the job is
+    // gone the bytes just sit in the pipe buffer until fclose() drops them.
+    $h = @fopen($p['fifo'], 'r+');
+    if (!$h) {
+        return false;
+    }
+    stream_set_blocking($h, false);
+    $wrote = @fwrite($h, $text);
+    fclose($h);
+    // A short write means the buffer was full with nothing draining it, so
+    // report it rather than pretend the whole line was delivered.
+    return $wrote === strlen($text);
 }
 
 function wt_job_running($id)
@@ -830,6 +1018,8 @@ function wt_job_list($identityId, $limit = 50)
             'started' => $meta['started'],
             'running' => $running,
             'exit'    => $exitCode,
+            'canInput' => !empty($meta['fifo']),
+            'pty'      => !empty($meta['pty']),
         ];
     }
     usort($out, function ($a, $b) {
@@ -1051,11 +1241,26 @@ if ($wtIsPost) {
             'dataDirWritable' => wt_data_writable(),
             'auditLog' => TERMINAL_ENABLE_AUDIT_LOG,
             'scriptPath' => __FILE__,
+            'inputAvailable' => !wt_is_windows() && wt_has_mkfifo(),
+            'ptyAvailable' => !wt_is_windows() && wt_has_pty_python(),
         ]);
     }
 
     if ($action === 'history') {
         wt_json(['ok' => true, 'history' => wt_history_get($identityId)]);
+    }
+
+    if ($action === 'env') {
+        // Cast to object: PHP's json_encode renders an empty array as JSON `[]`
+        // rather than `{}`, which would make an empty, otherwise-object-shaped
+        // "env" field surprise any client expecting a map.
+        wt_json(['ok' => true, 'env' => (object) wt_env_get($identityId)]);
+    }
+
+    if ($action === 'reset_env') {
+        wt_env_clear($identityId);
+        wt_audit($identityId, 'reset_env');
+        wt_json(['ok' => true, 'output' => "Exported variables cleared for this session.\n"]);
     }
 
     if ($action === 'jobs') {
@@ -1073,6 +1278,24 @@ if ($wtIsPost) {
         wt_json(['ok' => true, 'output' => "Kill signal sent.\n"]);
     }
 
+    if ($action === 'input') {
+        $job  = isset($input['job']) && is_string($input['job']) ? $input['job'] : '';
+        $text = isset($input['data']) && is_string($input['data']) ? $input['data'] : '';
+        $meta = $job !== '' ? wt_job_meta_read($job) : null;
+        if ($meta === null || $meta['identity'] !== $identityId) {
+            wt_bad_request('Unknown job.', 404);
+        }
+        if (!wt_job_running($job)) {
+            wt_json(['ok' => false, 'output' => "That job has already finished.\n"]);
+        }
+        if (empty($meta['fifo'])) {
+            wt_json(['ok' => false, 'output' => "This job has no input channel (mkfifo is unavailable on this host).\n"]);
+        }
+        $sent = wt_job_send_input($job, $text);
+        wt_audit($identityId, 'input', $job . ' (' . strlen($text) . ' bytes)');
+        wt_json(['ok' => $sent, 'output' => $sent ? '' : "Could not write to the job's input.\n"]);
+    }
+
     if ($action === 'poll') {
         $job    = isset($input['job']) && is_string($input['job']) ? $input['job'] : '';
         $offset = isset($input['offset']) ? max(0, (int) $input['offset']) : 0;
@@ -1083,11 +1306,12 @@ if ($wtIsPost) {
         list($chunk, $newOffset) = wt_job_tail($job, $offset, TERMINAL_MAX_OUTPUT);
         $running = wt_job_running($job);
         $resp = [
-            'ok'     => true,
-            'state'  => $running ? 'running' : 'done',
-            'output' => $chunk,
-            'offset' => $newOffset,
-            'job'    => $job,
+            'ok'       => true,
+            'state'    => $running ? 'running' : 'done',
+            'output'   => $chunk,
+            'offset'   => $newOffset,
+            'job'      => $job,
+            'canInput' => $running && !empty($meta['fifo']),
         ];
         if (!$running) {
             list($exitCode, $newCwd) = wt_job_result($job);
@@ -1115,9 +1339,7 @@ if ($wtIsPost) {
             wt_bad_request('Invalid base64 payload.');
         }
         $cwd = wt_get_cwd($identityId);
-        $dest = (strlen($path) > 0 && ($path[0] === '/' || preg_match('#^[A-Za-z]:[\\\\/]#', $path)))
-            ? $path
-            : rtrim($cwd, '/\\') . DIRECTORY_SEPARATOR . $path;
+        $dest = wt_resolve_path($path, $cwd);
         $dir = dirname($dest);
         if (!is_dir($dir)) {
             @mkdir($dir, 0755, true);
@@ -1136,9 +1358,7 @@ if ($wtIsPost) {
             wt_bad_request('path is required.');
         }
         $cwd = wt_get_cwd($identityId);
-        $src = (strlen($path) > 0 && ($path[0] === '/' || preg_match('#^[A-Za-z]:[\\\\/]#', $path)))
-            ? $path
-            : rtrim($cwd, '/\\') . DIRECTORY_SEPARATOR . $path;
+        $src = wt_resolve_path($path, $cwd);
         if (!is_file($src) || !is_readable($src)) {
             wt_bad_request('File not found or not readable: ' . $src, 404);
         }
@@ -1156,6 +1376,171 @@ if ($wtIsPost) {
         header('Content-Security-Policy: sandbox');
         readfile($src);
         exit;
+    }
+
+    // ---- FILE MANAGER ----
+    // Unrestricted by design, like the rest of this tool (see README): the
+    // only gate is being authenticated at all. Paths resolve the same way
+    // upload/download already do (wt_resolve_path).
+
+    if ($action === 'fs_list') {
+        $path = isset($input['path']) && is_string($input['path']) ? trim($input['path']) : '.';
+        $cwd  = wt_get_cwd($identityId);
+        $dir  = $path === '' ? $cwd : wt_resolve_path($path, $cwd);
+        if (!is_dir($dir) || !is_readable($dir)) {
+            wt_bad_request('Not a readable directory: ' . $dir, 404);
+        }
+        $real = @realpath($dir);
+        $entries = [];
+        foreach (scandir($dir) ?: [] as $name) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+            $full = rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . $name;
+            $isDir = @is_dir($full);
+            $isLink = @is_link($full);
+            $size = $isDir ? null : @filesize($full);
+            $entries[] = [
+                'name'  => $name,
+                'type'  => $isLink ? 'link' : ($isDir ? 'dir' : 'file'),
+                'size'  => $size === false ? null : $size,
+                'mtime' => @filemtime($full) ?: null,
+                'perm'  => substr(sprintf('%o', @fileperms($full) ?: 0), -4),
+                'writable' => @is_writable($full),
+            ];
+        }
+        usort($entries, function ($a, $b) {
+            if ($a['type'] === 'dir' && $b['type'] !== 'dir') return -1;
+            if ($b['type'] === 'dir' && $a['type'] !== 'dir') return 1;
+            return strcasecmp($a['name'], $b['name']);
+        });
+        wt_json(['ok' => true, 'path' => $real !== false ? $real : $dir, 'entries' => $entries]);
+    }
+
+    if ($action === 'fs_read') {
+        $path = isset($input['path']) && is_string($input['path']) ? trim($input['path']) : '';
+        if ($path === '') {
+            wt_bad_request('path is required.');
+        }
+        $cwd = wt_get_cwd($identityId);
+        $src = wt_resolve_path($path, $cwd);
+        if (!is_file($src) || !is_readable($src)) {
+            wt_bad_request('File not found or not readable: ' . $src, 404);
+        }
+        $size = filesize($src);
+        if ($size > TERMINAL_MAX_EDIT_BYTES) {
+            wt_json([
+                'ok' => false,
+                'output' => "File is " . round($size / 1048576, 1) . " MB, too large to edit here "
+                    . "(limit " . round(TERMINAL_MAX_EDIT_BYTES / 1048576) . " MB) - use download instead.\n",
+            ]);
+        }
+        $content = @file_get_contents($src);
+        if ($content === false) {
+            wt_json(['ok' => false, 'output' => "Could not read {$src}\n"]);
+        }
+        // The editor round-trips content through JSON, and wt_json() encodes
+        // with JSON_INVALID_UTF8_SUBSTITUTE - so a file that is not valid
+        // UTF-8 comes back full of U+FFFD and saving it rewrites the file.
+        // A null byte is the cheap "this is binary" signal; a failed /u match
+        // catches every other encoding (latin-1, cp1252, ...). Neither is
+        // offered to the editor; both say to use download instead, which is
+        // byte-exact, and 'encoding' says which one it was so the UI and the
+        // CLI can explain it.
+        $binary = strpos($content, "\0") !== false;
+        $utf8   = !$binary && @preg_match('//u', $content) === 1;
+        wt_json([
+            'ok'       => true,
+            'path'     => $src,
+            'binary'   => !$utf8,
+            'encoding' => $utf8 ? 'utf-8' : ($binary ? 'binary' : 'non-utf8'),
+            'content'  => $utf8 ? $content : '',
+            'size'     => $size,
+        ]);
+    }
+
+    if ($action === 'fs_write') {
+        $path = isset($input['path']) && is_string($input['path']) ? trim($input['path']) : '';
+        $content = isset($input['content']) && is_string($input['content']) ? $input['content'] : null;
+        if ($path === '' || $content === null) {
+            wt_bad_request('path and content are required.');
+        }
+        if (strlen($content) > TERMINAL_MAX_EDIT_BYTES) {
+            wt_bad_request('Content too large (limit ~' . round(TERMINAL_MAX_EDIT_BYTES / 1048576) . ' MB).', 413);
+        }
+        $cwd = wt_get_cwd($identityId);
+        $dest = wt_resolve_path($path, $cwd);
+        $written = @file_put_contents($dest, $content, LOCK_EX);
+        if ($written === false) {
+            wt_json(['ok' => false, 'output' => "Could not write to {$dest}\n"]);
+        }
+        wt_audit($identityId, 'fs_write', $dest . ' (' . $written . ' bytes)');
+        wt_json(['ok' => true, 'output' => "Saved " . $written . " bytes to {$dest}\n", 'path' => $dest]);
+    }
+
+    if ($action === 'fs_mkdir') {
+        $path = isset($input['path']) && is_string($input['path']) ? trim($input['path']) : '';
+        if ($path === '') {
+            wt_bad_request('path is required.');
+        }
+        $cwd  = wt_get_cwd($identityId);
+        $dest = wt_resolve_path($path, $cwd);
+        if (is_dir($dest)) {
+            wt_json(['ok' => false, 'output' => "{$dest} already exists.\n"]);
+        }
+        if (!@mkdir($dest, 0755, true)) {
+            wt_json(['ok' => false, 'output' => "Could not create {$dest}\n"]);
+        }
+        wt_audit($identityId, 'fs_mkdir', $dest);
+        wt_json(['ok' => true, 'output' => "Created {$dest}\n", 'path' => $dest]);
+    }
+
+    if ($action === 'fs_delete') {
+        $path = isset($input['path']) && is_string($input['path']) ? trim($input['path']) : '';
+        if ($path === '') {
+            wt_bad_request('path is required.');
+        }
+        $cwd    = wt_get_cwd($identityId);
+        $target = wt_resolve_path($path, $cwd);
+        if (is_dir($target) && !is_link($target)) {
+            // Deliberately refuse non-empty directories rather than recursing
+            // ourselves: `rm -rf` in the terminal is one command away and
+            // makes the destructive, recursive choice explicit.
+            $isEmpty = count(@scandir($target) ?: ['.', '..']) <= 2;
+            if (!$isEmpty) {
+                wt_json(['ok' => false, 'output' => "{$target} is a non-empty directory - use rm -rf in the terminal.\n"]);
+            }
+            if (!@rmdir($target)) {
+                wt_json(['ok' => false, 'output' => "Could not remove {$target}\n"]);
+            }
+        } elseif (is_file($target) || is_link($target)) {
+            if (!@unlink($target)) {
+                wt_json(['ok' => false, 'output' => "Could not delete {$target}\n"]);
+            }
+        } else {
+            wt_bad_request('Not found: ' . $target, 404);
+        }
+        wt_audit($identityId, 'fs_delete', $target);
+        wt_json(['ok' => true, 'output' => "Deleted {$target}\n"]);
+    }
+
+    if ($action === 'fs_rename') {
+        $from = isset($input['path']) && is_string($input['path']) ? trim($input['path']) : '';
+        $to   = isset($input['newPath']) && is_string($input['newPath']) ? trim($input['newPath']) : '';
+        if ($from === '' || $to === '') {
+            wt_bad_request('path and newPath are required.');
+        }
+        $cwd  = wt_get_cwd($identityId);
+        $src  = wt_resolve_path($from, $cwd);
+        $dest = wt_resolve_path($to, $cwd);
+        if (!file_exists($src)) {
+            wt_bad_request('Not found: ' . $src, 404);
+        }
+        if (!@rename($src, $dest)) {
+            wt_json(['ok' => false, 'output' => "Could not rename {$src} to {$dest}\n"]);
+        }
+        wt_audit($identityId, 'fs_rename', $src . ' -> ' . $dest);
+        wt_json(['ok' => true, 'output' => "Renamed to {$dest}\n", 'path' => $dest]);
     }
 
     // ---- EXEC ----
@@ -1203,7 +1588,8 @@ if ($wtIsPost) {
         ]);
     }
 
-    $jobId = wt_job_start($command, $cwd, $identityId);
+    $pty   = !empty($input['pty']);
+    $jobId = wt_job_start($command, $cwd, $identityId, $pty);
     if ($jobId === null) {
         wt_json(['ok' => false, 'output' => "Could not start the command on this host.\n"]);
     }
@@ -1236,13 +1622,15 @@ if ($wtIsPost) {
         ]);
     }
 
+    $jobMeta = wt_job_meta_read($jobId);
     wt_json([
-        'ok'     => true,
-        'state'  => 'running',
-        'output' => $chunk,
-        'offset' => $offset,
-        'job'    => $jobId,
-        'cwd'    => $cwd,
+        'ok'       => true,
+        'state'    => 'running',
+        'output'   => $chunk,
+        'offset'   => $offset,
+        'job'      => $jobId,
+        'cwd'      => $cwd,
+        'canInput' => $jobMeta !== null && !empty($jobMeta['fifo']),
     ]);
 }
 
@@ -1257,6 +1645,7 @@ $wtBoot = [
     'configured'  => wt_password_configured(),
     'apiKey'      => wt_api_key_configured(),
     'jobs'        => !wt_is_windows(),
+    'pty'         => !wt_is_windows() && wt_has_pty_python(),
 ];
 ?>
 <!DOCTYPE html>
@@ -1364,6 +1753,22 @@ $wtBoot = [
         .job-status { font-size: 11px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--border); }
         .job-status.running { color: var(--ok); border-color: var(--ok); }
         .job-row .icon-btn { padding: 1px 6px; font-size: 11px; }
+        .files-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+        .files-path { flex: 1 1 auto; min-width: 0; overflow-x: auto; white-space: nowrap; color: var(--dim); font-size: 11.5px; }
+        .files-toolbar .icon-btn { padding: 1px 6px; font-size: 11px; }
+        .file-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; border-bottom: 1px dashed var(--border); cursor: pointer; }
+        .file-row:last-child { border-bottom: none; }
+        .file-row .f-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .file-row .f-name.dir { color: #539bf5; font-weight: 600; }
+        .file-row .f-size { color: var(--dim); font-size: 11px; width: 64px; text-align: right; flex: 0 0 auto; }
+        .file-row .icon-btn { padding: 1px 6px; font-size: 11px; opacity: .7; }
+        .file-row .icon-btn:hover { opacity: 1; }
+        .files-editor textarea {
+            width: 100%; min-height: 220px; resize: vertical; background: var(--out-bg); color: var(--text);
+            border: 1px solid var(--border); border-radius: 4px; padding: 8px; font-family: inherit; font-size: 12.5px;
+            box-sizing: border-box;
+        }
+        .files-editor-actions { display: flex; gap: 8px; margin-top: 8px; }
         .terminal-output {
             flex: 1 1 auto;
             /* min-height:0 is what lets a flex child shrink and scroll instead
@@ -1388,6 +1793,12 @@ $wtBoot = [
         .terminal-output .ok { color: var(--ok); }
         .terminal-output .sys { color: var(--dim); }
         .runbar { display: none; align-items: center; gap: 8px; padding: 6px 12px; background: var(--panel2); border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); flex: 0 0 auto; }
+        .job-input {
+            flex: 1 1 auto; max-width: 320px; background: var(--input-bg, var(--panel));
+            color: var(--fg); border: 1px solid var(--border); border-radius: 4px;
+            padding: 4px 8px; font-family: inherit; font-size: 12px;
+        }
+        .job-input:focus { outline: none; border-color: #539bf5; }
         .runbar.show { display: flex; }
         .spinner { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--accent); animation: spin .8s linear infinite; flex: 0 0 auto; }
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -1445,6 +1856,11 @@ $wtBoot = [
             font-family: inherit;
             font-size: 14px;
         }
+        .pty-toggle {
+            display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted);
+            user-select: none; cursor: pointer; flex: 0 0 auto; padding: 0 4px;
+        }
+        .pty-toggle input { width: auto; flex: none; }
         .drop-hint { display: none; position: absolute; inset: 0; background: rgba(74,95,193,.15); border: 2px dashed var(--accent); align-items: center; justify-content: center; font-size: 18px; color: var(--text); pointer-events: none; z-index: 5; }
         .drop-hint.show { display: flex; }
         .login-overlay {
@@ -1491,6 +1907,7 @@ $wtBoot = [
         <div class="title">Web Terminal</div>
         <div class="right">
             <button class="icon-btn" id="cmdsBtn" type="button" title="Show common commands">Cmds</button>
+            <button class="icon-btn" id="filesBtn" type="button" title="Browse and edit files">Files</button>
             <button class="icon-btn" id="infoBtn" type="button" title="System info">Info</button>
             <button class="icon-btn" id="jobsBtn" type="button" title="Background jobs">Jobs</button>
             <button class="icon-btn" id="uploadBtn" type="button" title="Upload a file">Upload</button>
@@ -1506,14 +1923,19 @@ $wtBoot = [
     <div class="runbar" id="runbar">
         <span class="spinner"></span>
         <span id="runbarText">Running...</span>
+        <input type="text" id="jobInput" class="job-input" placeholder="Send input to this job..." style="display:none" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
         <button class="icon-btn danger" id="killBtn" type="button" style="margin-left:auto;">Kill</button>
     </div>
     <div class="suggest" id="suggest"></div>
     <div class="terminal-input">
         <span class="prompt" id="promptEl">$</span>
         <input type="text" id="commandInput" placeholder="Type a command... (Tab completes, ↑↓ history)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" disabled />
+        <label class="pty-toggle" id="ptyToggleWrap" title="Run the next command under a pseudo-terminal (isatty() programs, interactive prompts). Output is still scrollback-only, not a redrawn screen." style="display:none">
+            <input type="checkbox" id="ptyToggle" /> PTY
+        </label>
     </div>
     <input type="file" id="fileInput" style="display:none" multiple />
+    <input type="file" id="filesUploadInput" style="display:none" multiple />
     <div class="drop-hint" id="dropHint">Drop file to upload to the current directory</div>
     <div class="login-overlay" id="loginOverlay">
         <div class="login-box">
@@ -1541,6 +1963,10 @@ $wtBoot = [
     const runbar = el('runbar');
     const runbarText = el('runbarText');
     const killBtn = el('killBtn');
+    const jobInput = el('jobInput');
+    const ptyToggle = el('ptyToggle');
+    const ptyToggleWrap = el('ptyToggleWrap');
+    if (BOOT.pty) ptyToggleWrap.style.display = '';
     const suggestEl = el('suggest');
     const dropHint = el('dropHint');
     const fileInput = el('fileInput');
@@ -1810,12 +2236,28 @@ $wtBoot = [
         loginHint.style.display = 'block';
     }
 
-    function setRunning(isRunning, label) {
+    function setRunning(isRunning, label, canInput) {
         runbar.classList.toggle('show', isRunning);
         if (label) runbarText.textContent = label;
         cmdInput.disabled = isRunning || !authed;
+        jobInput.style.display = (isRunning && canInput) ? '' : 'none';
+        if (isRunning && canInput) {
+            jobInput.value = '';
+            jobInput.focus();
+        }
         if (!isRunning && authed) cmdInput.focus();
     }
+
+    async function sendJobInput() {
+        if (!currentJob) return;
+        const text = jobInput.value;
+        jobInput.value = '';
+        await api({ action: 'input', job: currentJob, data: text + '\n' });
+        appendOutput('> ' + text + '\n', 'sys');
+    }
+    jobInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); sendJobInput(); }
+    });
 
     function stopPolling() {
         if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
@@ -1827,6 +2269,7 @@ $wtBoot = [
         if (data.httpStatus === 401) { leaveTerminal(data.output || 'Session expired.\n'); return; }
         appendCommandOutput(data.output || '');
         offset = data.offset;
+        jobInput.style.display = (data.state === 'running' && data.canInput) ? '' : 'none';
         if (data.state === 'done') {
             currentJob = null;
             setRunning(false);
@@ -1842,6 +2285,7 @@ $wtBoot = [
     async function doKill() {
         if (!currentJob) return;
         await api({ action: 'kill', job: currentJob });
+        jobInput.style.display = 'none';
         appendOutput('\n[kill signal sent]\n', 'sys');
     }
     killBtn.addEventListener('click', doKill);
@@ -1853,12 +2297,16 @@ $wtBoot = [
         if (name === 'exit' || name === 'logout') { performLogout(); return true; }
         if (name === 'help') {
             appendOutput(
-                'Built-in: clear, exit, help, theme, upload, download <path>, jobs, cmds, history\n' +
+                'Built-in: clear, exit, help, theme, upload, download <path>, jobs, files, cmds, history\n' +
                 'cmds          show the common command cheat sheet (click one to run it)\n' +
+                'files         open the file manager (browse, edit, rename, delete)\n' +
                 'Tab           complete the word you are typing; ↑↓ pick a suggestion\n' +
                 'Ctrl+L        clear screen      Ctrl+C  kill the running job\n' +
                 'Real shell commands (ls, pwd, git, php, composer, ...) run on the server.\n' +
                 'Long-running commands become a background job automatically - watch the status bar.\n' +
+                'A command waiting on input (e.g. `read`) gets an input box in the run bar.\n' +
+                'export FOO=bar persists between commands, same as cd. Tick PTY before Enter\n' +
+                'to run a command with a real pseudo-terminal attached.\n' +
                 'This same server also has a CLI client: see webterm_client.py in the repo.\n\n',
                 'sys'
             );
@@ -1867,6 +2315,7 @@ $wtBoot = [
         if (name === 'theme') { toggleTheme(); return true; }
         if (name === 'upload') { fileInput.click(); return true; }
         if (name === 'jobs') { togglePanel('jobs'); return true; }
+        if (name === 'files') { togglePanel('files'); return true; }
         if (name === 'cmds' || name === 'commands') { togglePanel('cmds'); return true; }
         if (name === 'download' && parts[1]) { triggerDownload(parts.slice(1).join(' ')); return true; }
         return false;
@@ -1881,13 +2330,15 @@ $wtBoot = [
         busy = true;
         setRunning(true, 'Running...');
         try {
-            const data = await api({ action: 'exec', command: cmd });
+            const execReq = { action: 'exec', command: cmd };
+            if (ptyToggle && ptyToggle.checked) execReq.pty = true;
+            const data = await api(execReq);
             if (data.httpStatus === 401) { leaveTerminal(data.output || 'Session expired.\n'); return; }
             appendCommandOutput(data.output || '');
             if (data.cwd) { cwd = data.cwd; updatePrompt(); }
             if (data.state === 'running' && data.job) {
                 currentJob = data.job;
-                setRunning(true, 'Running in background (job ' + data.job.slice(0, 8) + ')...');
+                setRunning(true, 'Running in background (job ' + data.job.slice(0, 8) + ')...', data.canInput);
                 pollTimer = setTimeout(() => pollJob(data.job, data.offset || 0), 700);
                 return;
             }
@@ -2066,6 +2517,7 @@ $wtBoot = [
 
     // ---- Panels: info / jobs ----
     let openPanel = null;
+    let filesPath = '.';
     async function togglePanel(name) {
         if (openPanel === name) { panelsEl.classList.remove('open'); panelsEl.innerHTML = ''; openPanel = null; return; }
         openPanel = name;
@@ -2097,8 +2549,139 @@ $wtBoot = [
                 historyIndex = history.length;
                 runCommand(cmd);
             }));
+        } else if (name === 'files') {
+            filesPath = '.';
+            await refreshFiles(filesPath);
         }
     }
+
+    // ---- File manager panel ----
+    function formatSize(n) {
+        if (n === null || n === undefined) return '';
+        if (n < 1024) return n + ' B';
+        if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+        return (n / 1048576).toFixed(1) + ' MB';
+    }
+    async function refreshFiles(path) {
+        const d = await api({ action: 'fs_list', path: path });
+        if (!d.ok) {
+            panelsEl.innerHTML = '<div class="panel"><h4>Files</h4><div class="sys" style="color:var(--err)">' +
+                escapeHtml(d.output || 'Could not list that directory.') + '</div></div>';
+            return;
+        }
+        filesPath = d.path;
+        const parentPath = d.path.replace(/[\\/]+$/, '').split(/[\\/]/).slice(0, -1).join('/') || '/';
+        let html = '<div class="panel"><div class="files-toolbar">' +
+            '<span class="files-path" title="' + escapeHtml(d.path) + '">' + escapeHtml(d.path) + '</span>' +
+            '<button class="icon-btn" data-new-file type="button">+ file</button>' +
+            '<button class="icon-btn" data-new-dir type="button">+ folder</button>' +
+            '<button class="icon-btn" data-upload-here type="button">upload</button>' +
+            '</div><div class="file-rows">';
+        if (d.path !== '/' && d.path !== parentPath) {
+            html += '<div class="file-row" data-nav="' + escapeHtml(parentPath) + '"><span class="f-name dir">..</span></div>';
+        }
+        (d.entries || []).forEach(en => {
+            const isDir = en.type === 'dir';
+            html += '<div class="file-row"' + (isDir ? ' data-nav="' + escapeHtml(d.path.replace(/[\\/]+$/, '') + '/' + en.name) + '"' : ' data-edit="' + escapeHtml(en.name) + '"') + '>' +
+                '<span class="f-name' + (isDir ? ' dir' : '') + '">' + escapeHtml(en.name) + (isDir ? '/' : '') + '</span>' +
+                '<span class="f-size">' + (isDir ? '' : formatSize(en.size)) + '</span>' +
+                (!isDir ? '<button class="icon-btn" data-dl="' + escapeHtml(en.name) + '" type="button">dl</button>' : '') +
+                '<button class="icon-btn" data-rename="' + escapeHtml(en.name) + '" type="button">ren</button>' +
+                '<button class="icon-btn danger" data-del="' + escapeHtml(en.name) + '" type="button">del</button>' +
+                '</div>';
+        });
+        html += '</div></div>';
+        panelsEl.innerHTML = html;
+        panelsEl.querySelectorAll('[data-nav]').forEach(b => b.addEventListener('click', () => refreshFiles(b.getAttribute('data-nav'))));
+        panelsEl.querySelectorAll('[data-edit]').forEach(row => row.addEventListener('click', (e) => {
+            if (e.target.closest('button')) return;
+            openFileEditor(filesPath.replace(/[\\/]+$/, '') + '/' + row.getAttribute('data-edit'));
+        }));
+        panelsEl.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', (e) => {
+            e.stopPropagation();
+            triggerDownload(filesPath.replace(/[\\/]+$/, '') + '/' + b.getAttribute('data-dl'));
+        }));
+        panelsEl.querySelectorAll('[data-rename]').forEach(b => b.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const oldName = b.getAttribute('data-rename');
+            const newName = prompt('Rename "' + oldName + '" to:', oldName);
+            if (!newName || newName === oldName) return;
+            const base = filesPath.replace(/[\\/]+$/, '');
+            const r = await api({ action: 'fs_rename', path: base + '/' + oldName, newPath: base + '/' + newName });
+            if (!r.ok) alert(r.output || 'Rename failed.');
+            refreshFiles(filesPath);
+        }));
+        panelsEl.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const name = b.getAttribute('data-del');
+            if (!confirm('Delete "' + name + '"? This cannot be undone.')) return;
+            const r = await api({ action: 'fs_delete', path: filesPath.replace(/[\\/]+$/, '') + '/' + name });
+            if (!r.ok) alert(r.output || 'Delete failed.');
+            refreshFiles(filesPath);
+        }));
+        const newFileBtn = panelsEl.querySelector('[data-new-file]');
+        if (newFileBtn) newFileBtn.addEventListener('click', async () => {
+            const name = prompt('New file name:');
+            if (!name) return;
+            const path = filesPath.replace(/[\\/]+$/, '') + '/' + name;
+            const r = await api({ action: 'fs_write', path: path, content: '' });
+            if (!r.ok) { alert(r.output || 'Could not create file.'); return; }
+            openFileEditor(path);
+        });
+        const newDirBtn = panelsEl.querySelector('[data-new-dir]');
+        if (newDirBtn) newDirBtn.addEventListener('click', async () => {
+            const name = prompt('New folder name:');
+            if (!name) return;
+            const r = await api({ action: 'fs_mkdir', path: filesPath.replace(/[\\/]+$/, '') + '/' + name });
+            if (!r.ok) alert(r.output || 'Could not create folder.');
+            refreshFiles(filesPath);
+        });
+        const uploadHereBtn = panelsEl.querySelector('[data-upload-here]');
+        if (uploadHereBtn) uploadHereBtn.addEventListener('click', () => filesUploadInput.click());
+    }
+    async function openFileEditor(path) {
+        const d = await api({ action: 'fs_read', path: path });
+        if (!d.ok) { alert(d.output || 'Could not open that file.'); return; }
+        if (d.binary) {
+            const why = d.encoding === 'non-utf8'
+                ? 'This file is not valid UTF-8 text, so the editor would rewrite its bytes - use download instead.'
+                : 'This looks like a binary file - use download instead of the text editor.';
+            panelsEl.innerHTML = '<div class="panel files-editor"><h4>' + escapeHtml(path) + '</h4>' +
+                '<div class="sys" style="color:var(--dim)">' + why + '</div>' +
+                '<div class="files-editor-actions"><button class="icon-btn" data-back type="button">Back</button>' +
+                '<button class="icon-btn" data-dl type="button">Download</button></div></div>';
+        } else {
+            panelsEl.innerHTML = '<div class="panel files-editor"><h4>' + escapeHtml(path) + '</h4>' +
+                '<textarea id="filesEditorArea" spellcheck="false">' + escapeHtml(d.content) + '</textarea>' +
+                '<div class="files-editor-actions"><button class="icon-btn" data-save type="button">Save</button>' +
+                '<button class="icon-btn" data-back type="button">Back</button>' +
+                '<button class="icon-btn" data-dl type="button">Download</button></div></div>';
+        }
+        const saveBtn = panelsEl.querySelector('[data-save]');
+        if (saveBtn) saveBtn.addEventListener('click', async () => {
+            const content = el('filesEditorArea').value;
+            const r = await api({ action: 'fs_write', path: path, content: content });
+            saveBtn.textContent = r.ok ? 'Saved!' : 'Save failed';
+            setTimeout(() => { saveBtn.textContent = 'Save'; }, 1200);
+        });
+        panelsEl.querySelector('[data-back]').addEventListener('click', () => refreshFiles(filesPath));
+        panelsEl.querySelector('[data-dl]').addEventListener('click', () => triggerDownload(path));
+    }
+    const filesUploadInput = el('filesUploadInput');
+    async function uploadFileTo(file, dir) {
+        appendOutput('Uploading ' + file.name + ' to ' + dir + '...\n', 'sys');
+        try {
+            const b64 = await fileToBase64(file);
+            const dest = dir.replace(/[\\/]+$/, '') + '/' + file.name;
+            const data = await api({ action: 'upload', path: dest, data: b64 });
+            appendOutput((data.output || (data.ok ? 'Done.\n' : 'Upload failed.\n')), data.ok ? 'ok' : 'err');
+        } catch (e) { appendOutput('Upload failed.\n', 'err'); }
+        if (openPanel === 'files') refreshFiles(filesPath);
+    }
+    filesUploadInput.addEventListener('change', () => {
+        Array.from(filesUploadInput.files).forEach(f => uploadFileTo(f, filesPath));
+        filesUploadInput.value = '';
+    });
     async function refreshJobs() {
         const d = await api({ action: 'jobs' });
         const jobs = d.jobs || [];
@@ -2126,6 +2709,7 @@ $wtBoot = [
     el('infoBtn').addEventListener('click', () => togglePanel('info'));
     el('jobsBtn').addEventListener('click', () => togglePanel('jobs'));
     el('cmdsBtn').addEventListener('click', () => togglePanel('cmds'));
+    el('filesBtn').addEventListener('click', () => togglePanel('files'));
 
     // ---- Upload / download ----
     function fileToBase64(file) {
