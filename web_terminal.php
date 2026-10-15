@@ -879,10 +879,14 @@ function wt_job_send_input($id, $text)
     if (!file_exists($p['fifo'])) {
         return false;
     }
-    // A FIFO blocks on open-for-write-only if nothing is reading, but the
-    // job always holds it open read-write (see the "<>" redirect above), so
-    // this returns immediately whether or not the job is still running.
-    $h = @fopen($p['fifo'], 'w');
+    // Open read-write, not write-only: opening a FIFO for writing blocks
+    // until a reader shows up, and the only reader is the job process itself
+    // - which can exit between the caller's liveness check and this open. An
+    // O_RDWR open never blocks (the same trick as the "<>" redirect above), so
+    // that race costs a write nobody reads rather than wedging the request for
+    // max_execution_time. It also fails outright once the FIFO is gone, where
+    // "w" would silently re-create the path as a plain file and report success.
+    $h = @fopen($p['fifo'], 'r+');
     if (!$h) {
         return false;
     }
@@ -1431,9 +1435,14 @@ if ($wtIsPost) {
         if ($content === false) {
             wt_json(['ok' => false, 'output' => "Could not read {$src}\n"]);
         }
-        // A null byte is a cheap, reliable enough signal that this isn't text
-        // the browser's <textarea> can round-trip safely.
-        $binary = strpos($content, "\0") !== false;
+        // Refuse anything the editor cannot round-trip byte-for-byte. A null
+        // byte is the cheap "this is binary" signal, but it is not the only
+        // one that matters here: wt_json() encodes with
+        // JSON_INVALID_UTF8_SUBSTITUTE, so any byte sequence that is not
+        // valid UTF-8 (latin-1, cp1252, ...) would come back as U+FFFD and
+        // be written straight back over the file on save - silent
+        // corruption. Download is byte-exact, so send those there instead.
+        $binary = strpos($content, "\0") !== false || preg_match('//u', $content) !== 1;
         wt_json([
             'ok' => true,
             'path' => $src,
@@ -2628,7 +2637,7 @@ $wtBoot = [
         if (!d.ok) { alert(d.output || 'Could not open that file.'); return; }
         if (d.binary) {
             panelsEl.innerHTML = '<div class="panel files-editor"><h4>' + escapeHtml(path) + '</h4>' +
-                '<div class="sys" style="color:var(--dim)">This looks like a binary file - use download instead of the text editor.</div>' +
+                '<div class="sys" style="color:var(--dim)">This is binary, or not valid UTF-8 text - use download instead of the text editor.</div>' +
                 '<div class="files-editor-actions"><button class="icon-btn" data-back type="button">Back</button>' +
                 '<button class="icon-btn" data-dl type="button">Download</button></div></div>';
         } else {

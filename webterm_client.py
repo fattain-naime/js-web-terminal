@@ -35,8 +35,9 @@ Interactive session built-ins (not sent to the remote shell):
 Long-running remote commands are handled automatically: the server turns them
 into a background job and this client streams the output as it polls, exactly
 like the browser UI does. Press Ctrl+C to send a kill signal to the job that
-is currently running. If a job is reading input (e.g. a `read` prompt), just
-type and press Enter to send it through.
+is currently running. If a job is reading input (e.g. a `read` prompt), the REPL
+shows a `stdin → job` prompt - type the line and press Enter to send it
+through.
 
 Persisted state across commands: current directory and exported environment
 variables both carry over between commands in the same session, just like a
@@ -258,17 +259,23 @@ class WebTermClient:
 
     # ---- exec / poll / kill ----
 
-    def exec_stream(self, command, on_output, pty=False):
+    def exec_stream(self, command, on_output, pty=False, forward_stdin=True):
         """Run a command, streaming output to on_output(text). Returns exit code (int or None).
 
         If the job accepts input (see the `input` action / web_terminal.php's
-        wt_job_start FIFO), this also reads lines from stdin and forwards them
-        to the job while it runs - polling happens on a background thread so
-        typing doesn't have to wait for the next poll tick. The one wrinkle:
-        once the remote job finishes while this thread is blocked waiting for
-        a line, it only notices after the next Enter press - a plain stdlib
-        limitation with no portable fix, so it's worth knowing about rather
-        than surprising.
+        wt_job_start FIFO) and forward_stdin is set, this also reads lines from
+        stdin and forwards them to the job while it runs - polling happens on a
+        background thread so typing doesn't have to wait for the next poll
+        tick. The one wrinkle: once the remote job finishes while this thread
+        is blocked waiting for a line, it only notices after the next Enter
+        press - a plain stdlib limitation with no portable fix, so it's worth
+        knowing about rather than surprising.
+
+        Callers must pass forward_stdin=False for anything that is expected to
+        return on its own (`-c`): canInput reports a host capability, not that
+        this job is reading, so on a host with mkfifo it is true for every
+        background job - and a blocking read on stdin would keep `-c` alive
+        long after the command it was asked to run has finished.
         """
         exec_fields = {'pty': True} if pty else {}
         data = self.post('exec', command=command, **exec_fields)
@@ -326,10 +333,10 @@ class WebTermClient:
         t = threading.Thread(target=poll_loop, daemon=True)
         t.start()
         try:
-            if can_input:
+            if can_input and forward_stdin:
                 while not done.is_set():
                     try:
-                        line = input()
+                        line = input('stdin → job {}: '.format(job))
                     except EOFError:
                         break
                     if not done.is_set():
@@ -535,19 +542,25 @@ REPL_HELP = """
 
 Paths containing spaces can be quoted: !download "my file.txt" ./out.txt
 Everything else is sent to the server as a real shell command. If the job
-accepts input (e.g. it calls `read`), just type it and press Enter.
+accepts input (e.g. it calls `read`), a `stdin → job` prompt appears - type the
+line and press Enter to send it.
 """
 
 
 def print_chunk(text):
+    # Normalise CR away. A PTY job's output carries CRLF (the pty slave's
+    # onlcr is on), so piping or redirecting it would otherwise leave a stray
+    # CR on every line and break grep/diff. The browser drops the same
+    # characters for the same reason (see ansiToSegments), and this is a
+    # scrollback-only client: a bare CR carries no cursor to move.
     if text:
-        sys.stdout.write(text)
+        sys.stdout.write(text.replace('\r\n', '\n').replace('\r', '\n'))
         sys.stdout.flush()
 
 
 def run_one_shot(client, command, pty=False):
     try:
-        code = client.exec_stream(command, print_chunk, pty=pty)
+        code = client.exec_stream(command, print_chunk, pty=pty, forward_stdin=False)
     except KeyboardInterrupt:
         sys.exit(130)
     sys.exit(code if isinstance(code, int) else 0)
@@ -564,15 +577,18 @@ def edit_remote_file(client, path):
         eprint((data.get('output') or 'Could not read file.').rstrip())
         return
     if data.get('binary'):
-        eprint('{} is a binary file ({} bytes) - edit not supported here.'.format(
+        eprint('{} is binary or not valid UTF-8 ({} bytes) - edit not supported here.'.format(
             data.get('path', path), data.get('size', '?')))
         return
     original = data.get('content') or ''
     editor = os.environ.get('EDITOR') or ('notepad' if os.name == 'nt' else 'vi')
     suffix = os.path.splitext(path)[1] or '.txt'
+    # fs_read only hands back valid UTF-8, so pin the temp file's encoding
+    # rather than inheriting the locale's (a C locale would raise on any
+    # non-ASCII character), and keep newline='' so \r\n survives verbatim.
     fd, tmp_path = tempfile.mkstemp(prefix='webterm_edit_', suffix=suffix)
     try:
-        with os.fdopen(fd, 'w', newline='') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
             f.write(original)
         try:
             ret = subprocess.call([editor, tmp_path])
@@ -581,7 +597,7 @@ def edit_remote_file(client, path):
             return
         if ret != 0:
             eprint('Editor exited with status {}; uploading anyway if content changed.'.format(ret))
-        with open(tmp_path, 'r', newline='') as f:
+        with open(tmp_path, 'r', encoding='utf-8', newline='') as f:
             updated = f.read()
         if updated == original:
             print('No changes.')
@@ -716,7 +732,7 @@ def repl(client, pty=False):
             if not data.get('ok', True):
                 eprint((data.get('output') or 'Could not read file.').rstrip())
             elif data.get('binary'):
-                eprint('{} is a binary file ({} bytes) - use !download instead.'.format(
+                eprint('{} is binary or not valid UTF-8 ({} bytes) - use !download instead.'.format(
                     data.get('path', parts[0]), data.get('size', '?')))
             else:
                 sys.stdout.write(data.get('content') or '')
@@ -787,7 +803,8 @@ def repl(client, pty=False):
             continue
 
         try:
-            code = client.exec_stream(cmd, print_chunk, pty=pty_mode)
+            code = client.exec_stream(cmd, print_chunk, pty=pty_mode,
+                                    forward_stdin=sys.stdin.isatty())
         except KeyboardInterrupt:
             continue
         except AuthError as e:
